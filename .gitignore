@@ -1,0 +1,22 @@
+node_modules/
+.DS_Store
+Thumbs.db
+*.vsix
+*.zip
+!dist/zerog-code-*.vsix
+!dist/zerog-code-chrome-extension-*.zip
+
+# Local user configs, runtime state, logs & secrets (never commit)
+bridge.config.json
+*.local.json
+mcp_config.json
+.mcp.json
+settings.json
+state.json
+web_usage.json
+LOCAL_TOOL_INDEX.md
+bridge.log
+bridge.pid
+*.log
+.env
+.env.*
