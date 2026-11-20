@@ -1,4 +1,4 @@
-// Background Service Worker (v2.6.7):
+// Background Service Worker (v2.6.8):
 // 1. 严格隔离用户手动窗口 + 零残留受管窗口：绝不征用/跳转/关闭用户手动打开的 Gemini 页签，仅复用真实空闲的插件受管页签
 // 2. 串行路由 + 实时探活：单飞指令队列防并发抢占，派发前实时探测 streaming/thinking/pendingReply/hasConversation，后台 WEB_TICK 驱动不抢焦点
 // 3. 单会话精准中断：停止指令严格按 sessionId / webChatUrl 路由到对应标签页，绝不连带中断其它会话

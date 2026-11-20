@@ -10,15 +10,15 @@ Prebuilt release packages and one-shot deployment tools for **ZeroG Code** — a
 >
 > Release Repository: [https://github.com/orinplin99-maker/ZeroG-Code-release](https://github.com/orinplin99-maker/ZeroG-Code-release) · Full Deployment Guide: [**DEPLOY.md**](DEPLOY.md) · Changelog: [**CHANGELOG.md**](CHANGELOG.md)
 
-## Latest Release (`v0.7.7`)
+## Latest Release (`v0.7.8`)
 
 | Artifact | Component | Version |
 |---|---|---|
-| `dist/zerog-code-0.7.7.vsix` | ZeroG Code VS Code / Cursor Extension (`orinplin99-maker.zerog-code`) | `0.7.7` |
-| `dist/zerog-code-chrome-extension-2.6.7.zip` | ZeroG Code — Gemini Web Bridge (Chrome MV3 Extension) | `2.6.7` |
-| `web-bridge/` | Local Web Bridge daemon (`127.0.0.1:18765`), MCP server & unpacked Chrome extension | `2.6.7` |
-| `skills/zerog-code-deploy/` | Automated deployment Skill + one-shot Windows PowerShell installer (`deploy.ps1`) | `0.7.7` |
-| `release.json` | Release metadata and SHA-256 checksums | `0.7.7` |
+| `dist/zerog-code-0.7.8.vsix` | ZeroG Code VS Code / Cursor Extension (`orinplin99-maker.zerog-code`) | `0.7.8` |
+| `dist/zerog-code-chrome-extension-2.6.8.zip` | ZeroG Code — Gemini Web Bridge (Chrome MV3 Extension) | `2.6.8` |
+| `web-bridge/` | Local Web Bridge daemon (`127.0.0.1:18765`), MCP server & unpacked Chrome extension | `2.6.8` |
+| `skills/zerog-code-deploy/` | Automated deployment Skill + one-shot Windows PowerShell installer (`deploy.ps1`) | `0.7.8` |
+| `release.json` | Release metadata and SHA-256 checksums | `0.7.8` |
 
 ## Quick Install (Windows)
 

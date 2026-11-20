@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.8
+- **Faster Parallel `web_subagent` Orchestration & Tab-Lag Protection (`v2.6.8` Chrome Extension + Web Bridge)**:
+  - Lowered default `MAX_CONCURRENT_SUBAGENTS` from `3` to `2` (still configurable via `WEB_SUBAGENT_CONCURRENCY`) to prevent Chrome lag from excessive concurrent Gemini tabs while auto-closing finished tabs immediately (`web-bridge/server.mjs`).
+  - Tuned `web_subagent` defaults to `effort: "low"` and `maxSteps: 4` (max `8`) and tightened `buildSubagentProtocol` search discipline (search symbols first, ban sequential full-file scans from line 1, mandatory re-read on truncated target sections, concise <=600-char structured summary).
+  - Rewrote main collaboration prompts (`buildSystemToolProtocol` in `web-bridge/server.mjs` and `BOOT_PROMPT` in `web-bridge/chrome-extension/content.js`) with explicit dual-track routing (direct read for known single-point lookups vs. parallel `web_subagent` dispatch for cross-module/multi-layer investigations).
+  - Added first-turn cross-module research hints (`detectMultiModuleResearchHint`) and a dynamic serial-lookup nudge (`readOnlyStreak >= 2`) in `runReActToolStep` to proactively switch prolonged serial searches to parallel subagents.
+  - Hardened `parseToolCallsFromMarkdown` fallback matching so unlabeled JSON code blocks only trigger when placed at the end of a reply (<=80 trailing non-whitespace chars), preventing mid-response example JSON blocks from executing as local tool calls.
+
 ## 0.7.7
 - **Compact Context & Switch to Fresh Web Window (`/compact`, `/compact-web`)**:
   - Added one-click context compaction (`src/webHistoryStore.js`, `src/chatPanel.js`, `media/chat.js`) to summarize long conversations within a strict character budget, preserve all local history turns, open a fresh Gemini Web chat window with clean handoff context, archive previous `webChatUrl` links, and render live `compact_divider` cards.

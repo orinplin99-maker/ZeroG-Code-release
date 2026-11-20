@@ -61,8 +61,8 @@
     '  {"tool": "read_file", "args": {"path": "src/index.ts", "startLine": 1, "endLine": 120}}',
     ']',
     '```',
-    '可请求项：`get_context`（`rules`/`memory`/`skills`/`index`/`all`）、`read_file`、`find_files`、`search_code`、`list_dir`、`edit_file`、`write_file`、`run_command`、`mcp_list`、`mcp_call`、`web_subagent`。',
-    '协作习惯：附 `json:local-tool` 清单后结束本条回复并等待资料补充；引用文件路径与行号请统一使用反引号 `` `相对路径:行号` ``（如 `` `src/index.ts:42` ``）。收到请简短回复“协作已就绪”。',
+    '可请求项：`get_context`（`rules`/`memory`/`skills`/`index`/`all`）、`read_file`、`find_files`、`search_code`、`list_dir`、`edit_file`、`write_file`、`run_command`、`mcp_list`、`mcp_call`、`web_subagent`（跨模块/长调用链并行调研，单批最多 2 个，后台轻页签用完即关，不占主上下文）。',
+    '协作习惯：已知落点直查；跨模块或预计 ≥3 轮调研优先同批并行派发最多 2 个 `web_subagent`；附 `json:local-tool` 清单后结束本条回复并等待资料补充；路径用反引号 `` `相对路径:行号` ``。收到请简短回复“协作已就绪”。',
   ].join('\n');
 
   function bridgeRequest(method, endpoint, bodyObj) {
@@ -810,7 +810,7 @@
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
       <div style="font-weight:600;display:flex;align-items:center;gap:6px;">
         <span id="agwb-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#71717a;"></span>
-        <span>ZeroG Code Bridge v2.6.7</span>
+        <span>ZeroG Code Bridge v2.6.8</span>
         <span id="agwb-webmodel" style="color:#38bdf8;font-size:11px;font-weight:500;"></span>
       </div>
       <label style="cursor:pointer;display:flex;align-items:center;gap:4px;color:#a1a1aa;" title="仅纯网页对话时勾选；使用 VS Code 插件时保持关闭">

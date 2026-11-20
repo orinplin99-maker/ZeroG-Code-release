@@ -7,7 +7,7 @@ This directory contains the two runtime pieces that power ZeroG Code's **🌐 Ge
 | `server.mjs` | Local HTTP daemon (`127.0.0.1:18765`) orchestrating `json:local-tool` ReAct loops, serialized web sends, and per-session routing |
 | `mcp-server.mjs` | Optional stdio MCP server exposing `gemini_web_ask` and `gemini_web_agent` to `agy` / Claude Code |
 | `start-bridge.ps1` / `stop-bridge.ps1` | Windows background daemon start/stop helpers (survives VS Code Reload Window) |
-| `chrome-extension/` | Chrome Manifest V3 extension (`ZeroG Code — Gemini Web Bridge`, v2.6.7) communicating with `gemini.google.com` (prebuilt zip: `../dist/zerog-code-chrome-extension-2.6.7.zip`) |
+| `chrome-extension/` | Chrome Manifest V3 extension (`ZeroG Code — Gemini Web Bridge`, v2.6.8) communicating with `gemini.google.com` (prebuilt zip: `../dist/zerog-code-chrome-extension-2.6.8.zip`) |
 
 ## Runtime Location
 
@@ -31,7 +31,7 @@ Use `skills/zerog-code-deploy/scripts/deploy.ps1` (recommended — see [`../DEPL
    ```text
    %USERPROFILE%\.gemini\web-bridge\chrome-extension
    ```
-   *(Or extract `../dist/zerog-code-chrome-extension-2.6.7.zip` to a permanent folder and select that folder.)*
+   *(Or extract `../dist/zerog-code-chrome-extension-2.6.8.zip` to a permanent folder and select that folder.)*
 4. Sign in to `https://gemini.google.com` in Chrome.
 5. Verify the bridge sees the browser:
    ```powershell
@@ -41,7 +41,7 @@ Use `skills/zerog-code-deploy/scripts/deploy.ps1` (recommended — see [`../DEPL
 ## Repackaging the Chrome Extension
 
 ```powershell
-../scripts/build_chrome_ext.ps1   # Outputs ../dist/zerog-code-chrome-extension-2.6.7.zip
+../scripts/build_chrome_ext.ps1   # Outputs ../dist/zerog-code-chrome-extension-2.6.8.zip
 ```
 
 ## Optional: Custom Local Tool Index & Explicit Path Config (`bridge.config.json`)

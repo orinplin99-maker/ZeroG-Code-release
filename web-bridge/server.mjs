@@ -1453,12 +1453,23 @@ function buildContextQueryOutput(workCwd, opts = {}, kind = 'all', query = '') {
   return combined;
 }
 
+function detectMultiModuleResearchHint(rawPrompt) {
+  const text = String(rawPrompt || '').trim();
+  if (text.length < 10) return '';
+  if (/:\d+(?:-\d+)?\b/.test(text) && text.length < 80) return '';
+  const hasBroadSignal = /(全链路|调用链|排查|梳理|对比|架构|跨模块|一起查|分别查|为什么会|怎么实现|原理|机制|影响面|全量|盘点|分析一下|定位一下)/.test(text);
+  const hasMultiLayer = /(lua.*c\+\+|c\+\+.*lua|前端.*后端|客户端.*服务|配表.*代码|代码.*配表|插件.*扩展|server.*content)/i.test(text);
+  if (!hasBroadSignal && !hasMultiLayer) return '';
+  return `⚡ 加速建议：当前问题涉及跨模块或较长调用链排查，建议首轮直接并行派发最多 ${MAX_CONCURRENT_SUBAGENTS} 个 \`web_subagent\` 分头调研（可与 \`get_context\` 同批发出），将多轮串行压缩为 1 轮。`;
+}
+
 function buildSystemToolProtocol(cwd, opts = {}) {
   const workCwd = cwd || state.cwd || DEFAULT_CWD;
   const displayCwd = toDisplayPath(workCwd);
   const shellHint = IS_WIN ? 'PowerShell命令' : 'Shell命令';
+  const researchHint = opts?.researchHint ? String(opts.researchHint).trim() : '';
 
-  return [
+  const lines = [
     '### 工作区资料协作说明',
     `你只需输出纯文本分析。当需要我帮你从工作区摘取文件片段、搜索符号、查阅规范或应用代码改动时，可在回复末尾附一段 \`json:local-tool\` 清单，我会在下条消息把对应资料贴给你。工作区目录: \`${displayCwd}\``,
     '```json:local-tool',
@@ -1474,13 +1485,18 @@ function buildSystemToolProtocol(cwd, opts = {}) {
     '- `edit_file`: `{"path": "...", "target": "原文本", "replacement": "新文本"}` | `write_file`: `{"path": "...", "content": "全文"}`',
     `- \`run_command\`: \`{"command": "${shellHint}", "cwd": "可选目录", "timeoutMs": 180000}\``,
     '- `mcp_list`: `{"server": "可选服务名"}` | `mcp_call`: `{"server": "服务名", "mcpTool": "工具名", "args": {...}}`',
-    '- `web_subagent`: `{"role": "子任务角色", "task": "目标与返回格式", "readOnly": true, "maxSteps": 6}`（多模块并发调研用）',
-    '协作习惯：1) 涉及代码/规范先查阅再作答，附清单后结束本条回复；2) 单批建议 1~3 个小范围查询，大文件先 `search_code` 再分段读，避免单窗过长；3) 结论先行，路径用反引号 `` `src/file:line` ``（正斜杠）。',
-    '---',
-  ].join('\n');
+    `- \`web_subagent\`: \`{"role": "子任务角色", "task": "具体符号/问题与返回要求", "readOnly": true, "maxSteps": 4}\`（**并行调研提速**：后台轻页签并行跑完多步检索并立即自动关闭页签，不占主上下文；单批最多派 **${MAX_CONCURRENT_SUBAGENTS}** 个以免多开网页卡顿）`,
+    '协作习惯：',
+    '1) **先查后答**：涉及代码/规范先查阅再作答，附清单后立即结束本条回复。',
+    `2) **直查 vs 子代理分流**：已知精确落点且 1~2 批小查询可搞定 → 直接 \`search_code\`/\`read_file\`；**跨模块/跨层排查**（如 Lua+C++、多目录调用链）或**未知落点预计需 ≥3 轮检索** → 优先同批并行派发最多 ${MAX_CONCURRENT_SUBAGENTS} 个 \`web_subagent\`（可与 \`get_context\` 同批发出），并在 \`task\` 中要求先 \`search_code\` 定位再精读、返回“结论 + path:line + 关键分支”。`,
+    '3) **结论先行**：路径统一用反引号 `` `src/file:line` ``（正斜杠）。',
+  ];
+  if (researchHint) lines.push(researchHint);
+  lines.push('---');
+  return lines.join('\n');
 }
 
-function buildSubagentProtocol({ cwd, role, readOnly = true, maxSteps = 6 }) {
+function buildSubagentProtocol({ cwd, role, readOnly = true, maxSteps = 4 }) {
   const workCwd = cwd || state.cwd || DEFAULT_CWD;
   const displayCwd = toDisplayPath(workCwd);
   const shellHint = IS_WIN ? 'PowerShell命令' : 'Shell命令 (bash/zsh)';
@@ -1505,10 +1521,11 @@ function buildSubagentProtocol({ cwd, role, readOnly = true, maxSteps = 6 }) {
     readOnly
       ? '- 当前为只读子任务，禁止写入或修改文件（`edit_file`/`write_file` 已禁用）。'
       : '- `edit_file`: `{"path": "...", "target": "精确原文本", "replacement": "新文本"}` | `write_file`: `{"path": "...", "content": "完整内容"}`',
-    '协作要求：',
-    `1. 最多执行 ${maxSteps} 批请求；请合并只读查询，拿到充分证据后尽早总结；不可再调用 \`web_subagent\`。`,
-    '2. 输出 `json:local-tool` 后立即结束本次回复，等待真实结果贴回。',
-    '3. 最终结论请精炼、结论先行，附准确的反引号路径定位（如 `` `src/index.ts:42` ``，统一正斜杠，勿用相对路径 Markdown 链接）。',
+    '高效检索纪律（务必遵守以缩短耗时）：',
+    `1. 最多执行 ${maxSteps} 批请求（不可递归调用 \`web_subagent\`）；每批合并 2~4 个只读查询并发执行，力争 2~3 批收口。`,
+    '2. **禁止从第 1 行顺序通读大文件**：先用 `search_code` 搜目标符号拿到精确行号，再按命中区间直接 `read_file` 精读，跳过无关构造函数与初始化代码。',
+    '3. **截断必补读**：若核心函数处被截断且仍有剩余批次，必须立即补读该行段，禁止留一句“实现在后半段未读”就交卷。',
+    '4. 输出 `json:local-tool` 后立即结束本次回复；最终结论控制在 600 字内，结论先行，只列核心分支与反引号路径 `` `src/index.ts:42` ``（统一正斜杠）。',
     '---',
   ].join('\n');
 }
@@ -1587,8 +1604,13 @@ function parseToolCallsFromMarkdown(rawMarkdown) {
       continue;
     }
 
-    // 3. 任意语言标记的代码块，内容是 [{"tool": "read_file", ...}] 结构
-    if ((body.startsWith('[') && body.endsWith(']')) || (body.startsWith('{') && body.endsWith('}'))) {
+    // 3. 未标注 local-tool 的普通 JSON 代码块，仅当位于回复末尾（后续非空文本 <= 80 字符）时才兜底触发，
+    // 避免正文中间用于说明协议/示范的示例 JSON 被误当成真实工具调用执行
+    const afterBlockText = markdownText.slice(match.index + match[0].length).trim();
+    if (
+      afterBlockText.length <= 80 &&
+      ((body.startsWith('[') && body.endsWith(']')) || (body.startsWith('{') && body.endsWith('}')))
+    ) {
       const parsed = tryParseJsonLenient(body);
       if (parsed) {
         const arr = Array.isArray(parsed) ? parsed : [parsed];
@@ -2291,7 +2313,7 @@ function isTransientErrorReply(text) {
   return TRANSIENT_ERROR_REPLY_RE.test(trimmed);
 }
 
-const MAX_CONCURRENT_SUBAGENTS = Math.max(1, Math.min(4, Number(process.env.WEB_SUBAGENT_CONCURRENCY || 3)));
+const MAX_CONCURRENT_SUBAGENTS = Math.max(1, Math.min(4, Number(process.env.WEB_SUBAGENT_CONCURRENCY || 2)));
 const REACT_STEP_MIN_DELAY_MS = Math.max(0, Number(process.env.WEB_REACT_MIN_DELAY_MS ?? 2200));
 const REACT_STEP_JITTER_MS = Math.max(0, Number(process.env.WEB_REACT_JITTER_MS ?? 2000));
 const REFUSAL_RETRY_BASE_MS = Math.max(0, Number(process.env.WEB_REFUSAL_RETRY_BASE_MS ?? 2500));
@@ -2493,9 +2515,9 @@ async function runWebSubagentTool(args, workCwd, execContext = {}) {
     .replace(/^web:/i, '')
     .trim();
   const resolvedModel = rawModel || pickDefaultSubagentModel(parentTask?.webModel || '');
-  const resolvedEffort = String(args.effort || args.Effort || 'medium').trim().toLowerCase() || 'medium';
+  const resolvedEffort = String(args.effort || args.Effort || 'low').trim().toLowerCase() || 'low';
   const readOnly = args.readOnly !== false;
-  const maxSteps = Math.max(1, Math.min(12, Number(args.maxSteps || args.max_steps || 6)));
+  const maxSteps = Math.max(1, Math.min(8, Number(args.maxSteps || args.max_steps || 4)));
   const timeoutMs = Math.max(30000, Math.min(600000, Number(args.timeoutMs || args.timeout_ms || 240000)));
   const subCwd = args.cwd ? resolveSafePath(args.cwd, workCwd) : workCwd;
   const startedAt = Date.now();
@@ -2781,13 +2803,32 @@ async function runReActToolStep(task, parsedCall) {
   const partialHint = hadPartialRescue
     ? '（注：上一条回复在生成后续清单中途被网页中断，已先整理已完整收到的只读资料；如需继续建议单批仅附 1~2 项精简查询。）\n'
     : '';
+  const batchSpecs = parsedCall?.kind === 'json-tools' && Array.isArray(parsedCall.specs) ? parsedCall.specs : [];
+  const usedSubagentThisBatch = batchSpecs.some((s) => (s?.tool || s?.name) === 'web_subagent');
+  const isPureLocalReadBatch =
+    batchSpecs.length > 0 &&
+    !usedSubagentThisBatch &&
+    batchSpecs.every((s) => {
+      const t = s?.tool || s?.name;
+      return t === 'read_file' || t === 'search_code' || t === 'find_files' || t === 'list_dir';
+    });
+  if (!task.isSubagent) {
+    if (usedSubagentThisBatch) task.readOnlyStreak = 0;
+    else if (isPureLocalReadBatch) task.readOnlyStreak = (task.readOnlyStreak || 0) + 1;
+    else task.readOnlyStreak = 0;
+  }
+  const serialSubagentHint =
+    !task.isSubagent && !isFinal && (task.readOnlyStreak || 0) >= 2
+      ? `\n⚡ 加速提示：已连续串行检索 ${task.readOnlyStreak} 批；若后续仍需追踪其他模块或长调用链，建议本轮直接并行派发最多 ${MAX_CONCURRENT_SUBAGENTS} 个 \`web_subagent\` 一次性收口，减少来回轮次。`
+      : '';
+
   const nextStepInstruction = isFinal
     ? task.isSubagent
-      ? `已补充 ${task.step} 批资料，请立即基于以上内容输出精炼结构化结论（文件路径请用反引号格式 \`src/file:line\`），不再附清单块。`
+      ? `已补充 ${task.step} 批资料，请立即基于以上内容输出精炼结构化结论（控制在 600 字内，文件路径用反引号 \`src/file:line\`），不再附清单块。`
       : `本轮已补充 ${task.step} 批资料，请基于以上内容直接给出最终或阶段性纯文本结论，并说明待确认项，不再附清单块。`
     : task.isSubagent
-      ? `${partialHint}以上是你要的资料。如需补充请继续附只读 \`json:local-tool\` 清单；证据充分后请直接输出精炼结构化结论（路径用反引号 \`\` \`path:line\` \`\`）。`
-      : `${partialHint}以上是你要的资料。若还需查看或改动其他位置，请继续在末尾附精简 \`json:local-tool\` 清单（建议单批 1~3 项）；若信息已足够，请直接给出纯文本结论（路径用反引号 \`\` \`path:line\` \`\`）。`;
+      ? `${partialHint}以上是你要的资料。若核心位置被截断请立即补读该行段，否则请合并只读查询尽早收口；证据充分后直接输出精炼结论（路径用反引号 \`\` \`path:line\` \`\`）。`
+      : `${partialHint}以上是你要的资料。若还需查看或改动其他位置，请继续在末尾附精简 \`json:local-tool\` 清单（已知单点直查 1~3 项，跨模块调研可并行派发最多 ${MAX_CONCURRENT_SUBAGENTS} 个 \`web_subagent\`）；若信息已足够，请直接给出纯文本结论（路径用反引号 \`\` \`path:line\` \`\`）。${serialSubagentHint}`;
 
   task.currentStepPrompt = [
     `### 补充的工作区资料（第 ${task.step} 批${headerSuffix}）`,
@@ -3613,7 +3654,10 @@ const server = http.createServer(async (req, res) => {
         rulesDir: typeof body.rulesDir === 'string' && body.rulesDir.trim() ? body.rulesDir.trim() : undefined,
         memoryDir: typeof body.memoryDir === 'string' && body.memoryDir.trim() ? body.memoryDir.trim() : undefined,
       };
-      const firstPrompt = injectProtocol ? `${buildSystemToolProtocol(taskCwd, protocolOpts)}\n\n${rawPrompt}` : rawPrompt;
+      const researchHint = detectMultiModuleResearchHint(rawPrompt);
+      const firstPrompt = injectProtocol
+        ? `${buildSystemToolProtocol(taskCwd, { ...protocolOpts, researchHint })}\n\n${rawPrompt}`
+        : rawPrompt;
 
       if (body.webModel) webModelState.desiredModel = String(body.webModel).trim();
       if (body.webEffort) webModelState.desiredEffort = String(body.webEffort).trim().toLowerCase();
