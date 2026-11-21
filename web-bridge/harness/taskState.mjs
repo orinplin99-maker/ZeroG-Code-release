@@ -99,6 +99,26 @@ export function resetTaskStateForNewChat(sessionId, mode = 'accept-edits') {
 }
 
 /**
+ * 若当前会话尚未记录任务目标，自动从首轮用户提问回填一条精炼目标，
+ * 避免模型未显式调用 update_plan 时换窗交接丢失核心任务。
+ */
+export function ensureTaskGoal(sessionId, rawGoal, mode = 'accept-edits') {
+  if (!sessionId) return null;
+  const cleaned = String(rawGoal || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return loadTaskState(sessionId, mode);
+  const st = loadTaskState(sessionId, mode);
+  if (mode) st.mode = mode;
+  if (!st.goal) {
+    st.goal = cleaned.slice(0, 240);
+    saveTaskState(sessionId, st);
+  }
+  return st;
+}
+
+/**
  * 处理本地工具 update_plan 的入参，落盘并返回最新状态与人类可读反馈。
  */
 export function applyUpdatePlan(sessionId, args = {}, mode = 'accept-edits') {
@@ -173,19 +193,47 @@ export function recordTouchedFile(sessionId, displayPath, mode = 'accept-edits')
   return st;
 }
 
-export function bumpContextBudget(sessionId, { turnDelta = 0, stepDelta = 0, charsDelta = 0, resetTabBudget = false, mode } = {}) {
+export function bumpContextBudget(
+  sessionId,
+  { turnDelta = 0, stepDelta = 0, charsDelta = 0, resetTabBudget = false, countRollover = true, mode } = {}
+) {
   const st = loadTaskState(sessionId, mode);
   if (mode) st.mode = mode;
   if (resetTabBudget) {
+    st.contextBudget.turnCount = 0;
     st.contextBudget.stepCount = 0;
     st.contextBudget.approxChars = 0;
-    st.contextBudget.rolloverCount = (st.contextBudget.rolloverCount || 0) + 1;
+    if (countRollover !== false) {
+      st.contextBudget.rolloverCount = (st.contextBudget.rolloverCount || 0) + 1;
+    }
   } else {
-    st.contextBudget.turnCount = (st.contextBudget.turnCount || 0) + Number(turnDelta || 0);
-    st.contextBudget.stepCount = (st.contextBudget.stepCount || 0) + Number(stepDelta || 0);
+    st.contextBudget.turnCount = (st.contextBudget.turnCount || 0) + Math.max(0, Number(turnDelta || 0));
+    st.contextBudget.stepCount = (st.contextBudget.stepCount || 0) + Math.max(0, Number(stepDelta || 0));
     st.contextBudget.approxChars = (st.contextBudget.approxChars || 0) + Math.max(0, Number(charsDelta || 0));
   }
   return saveTaskState(sessionId, st);
+}
+
+export function getContextBudgetSnapshot(stateObj, opts = {}) {
+  const budget = stateObj?.contextBudget || {};
+  const stepThreshold = Math.max(3, Number(opts.stepThreshold || PROACTIVE_ROLLOVER_STEPS));
+  const charThreshold = Math.max(12000, Number(opts.charThreshold || PROACTIVE_ROLLOVER_CHARS));
+  const turnCount = Math.max(0, Number(budget.turnCount || 0));
+  const stepCount = Math.max(0, Number(budget.stepCount || 0));
+  const approxChars = Math.max(0, Number(budget.approxChars || 0));
+  const rolloverCount = Math.max(0, Number(budget.rolloverCount || 0));
+  const stepRatio = stepThreshold > 0 ? stepCount / stepThreshold : 0;
+  const charRatio = charThreshold > 0 ? approxChars / charThreshold : 0;
+  const pct = Math.min(100, Math.round(Math.max(stepRatio, charRatio) * 100));
+  return {
+    turnCount,
+    stepCount,
+    approxChars,
+    rolloverCount,
+    stepThreshold,
+    charThreshold,
+    pct,
+  };
 }
 
 export function shouldProactiveRollover(stateObj, opts = {}) {

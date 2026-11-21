@@ -2,7 +2,7 @@
 
 本文档覆盖 **ZeroG Code** 全栈 4 大组件的完整安装、配置与验证步骤：
 1. **Antigravity CLI (`agy`)** — 本地 CLI 引擎底座
-2. **ZeroG Code 插件（VS Code / Cursor）** — 预打包文件 [`dist/zerog-code-0.7.9.vsix`](dist/zerog-code-0.7.9.vsix)
+2. **ZeroG Code 插件（VS Code / Cursor）** — 预打包文件 [`dist/zerog-code-0.7.10.vsix`](dist/zerog-code-0.7.10.vsix)
 3. **本地 Web Bridge 守护进程 + MCP 服务** — [`web-bridge/`](web-bridge/)（运行于 `http://127.0.0.1:18765`）
 4. **Chrome MV3 浏览器拓展（`ZeroG Code — Gemini Web Bridge`）** — 预打包文件 [`dist/zerog-code-chrome-extension-2.7.0.zip`](dist/zerog-code-chrome-extension-2.7.0.zip)（解压源码同见 [`web-bridge/chrome-extension/`](web-bridge/chrome-extension/)）
 
@@ -30,7 +30,7 @@
 
 | 产物路径 | 组件 | 版本 | 用途 |
 |---|---|---|---|
-| `dist/zerog-code-0.7.9.vsix` | ZeroG Code VS Code / Cursor 插件 | `0.7.9` | 离线安装到 VS Code / Cursor（Extension ID：`orinplin99-maker.zerog-code`） |
+| `dist/zerog-code-0.7.10.vsix` | ZeroG Code VS Code / Cursor 插件 | `0.7.10` | 离线安装到 VS Code / Cursor（Extension ID：`orinplin99-maker.zerog-code`） |
 | `dist/zerog-code-chrome-extension-2.7.0.zip` | ZeroG Code — Gemini Web Bridge Chrome 拓展 | `2.7.0` | 解压后在 Chrome `chrome://extensions/` 加载 |
 | `skills/zerog-code-deploy/` | AI Agent 自动化部署 Skill | 最新 | 交给 Antigravity / Claude Code 一键全自动部署 |
 
@@ -111,12 +111,12 @@ agy
 #### 2) 安装 ZeroG Code 插件（VS Code / Cursor）
 ```powershell
 # VS Code
-code --install-extension .\dist\zerog-code-0.7.9.vsix --force
+code --install-extension .\dist\zerog-code-0.7.10.vsix --force
 
 # Cursor（可选）
-cursor --install-extension .\dist\zerog-code-0.7.9.vsix --force
+cursor --install-extension .\dist\zerog-code-0.7.10.vsix --force
 ```
-也可在 VS Code 左侧 **Extensions** 面板右上角 `...` → **Install from VSIX...** 中选择 `dist/zerog-code-0.7.9.vsix`。
+也可在 VS Code 左侧 **Extensions** 面板右上角 `...` → **Install from VSIX...** 中选择 `dist/zerog-code-0.7.10.vsix`。
 
 #### 3) 部署并启动本地 Web Bridge 与 MCP 服务
 ```powershell
@@ -171,7 +171,7 @@ Expand-Archive -Path .\dist\zerog-code-chrome-extension-2.7.0.zip -DestinationPa
 完成上述步骤后，运行以下两条校验命令：
 
 ```powershell
-# 1. 验证 VS Code 插件版本（应为 orinplin99-maker.zerog-code@0.7.9，且无旧版残留）
+# 1. 验证 VS Code 插件版本（应为 orinplin99-maker.zerog-code@0.7.10，且无旧版残留）
 code --list-extensions --show-versions | Select-String "zerog-code|ccweb|antigravity-tabs"
 
 # 2. 验证本地 Web Bridge 与 Chrome 拓展实时握手
@@ -179,7 +179,7 @@ Invoke-RestMethod http://127.0.0.1:18765/status | Select-Object ok, browserOnlin
 ```
 
 预期正常输出：
-- `orinplin99-maker.zerog-code@0.7.9`
+- `orinplin99-maker.zerog-code@0.7.10`
 - `ok: True` 且 `browserOnline: True`
 
 随后在 VS Code / Cursor 中：

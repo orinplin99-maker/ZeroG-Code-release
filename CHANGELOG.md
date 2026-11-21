@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.10
+- **Accurate Web Context Budgeting & Proactive Rollover Fixes (`web-bridge/server.mjs`, `harness/taskState.mjs`, `src/webBrainClient.js`)**:
+  - Fixed `charsDelta` in `runReActToolStep` (captured `currentStepText.length` before clearing it), accounted every turn's prompt & final reply (`turnDelta: 1` + `charsDelta`), and exposed `update_plan` in `buildSystemToolProtocol` while auto-backfilling `taskState.goal` from the first clean prompt.
+  - Reset per-window context budget cleanly on `newChat: true` (preserving long-term `goal`/`plan`/`touchedFiles` when `preserveTaskState: true`), passive refusal rollovers, and manual `/compact`; added `GET /web-brain/context-budget` and `POST /web-brain/context-budget/reset`.
+  - Fixed Proactive Rollover propagation (`poll.autoRolledOver` now includes `proactiveRolledOver`), restored original user prompt / prior analysis / `uiMode` in proactive rollover handoffs, allowed multiple rollovers in long tasks, and persisted rollover anchors (`recordAutoRolloverAnchor`) into local history with `compact_divider` cards.
+- **Next-Gen `/compact`: Zero-Quota Lazy Switching, Lightweight Semantic Summarization & External History Archives (`src/webHistoryStore.js`, `src/chatPanel.js`, `media/chat.js`)**:
+  - **Lazy Compact (default, `agyTabs.compactMode: "lazy"`)**: stages a structured handoff summary at zero main-model quota (surviving window reloads via `doc.pendingCompact`) and seamlessly switches to a fresh web window on the next real prompt; supports `/compact --now` / `--eager` for immediate switching.
+  - **Dual-Engine Summarizer (`agyTabs.compactSummarizer: "auto" | "hydrogen" | "local"`)**: added `POST /web-brain/summarize-compact` to distill up to 32k chars of incremental history via a lightweight auto-closing background tab (`4 Hydrogen low`) with seamless fallback to deterministic compaction; configurable via `agyTabs.compactBudgetChars` (default `8000`) and `/compact --ai` / `--local`.
+  - **Anti-Collapse Secondary Compaction & Externalized Archives**: persisted full `handoffMarkdown` on compact anchors so subsequent compactions never collapse to a short ack, and exported pre-compaction turns into `<agyDataDir>/web_history/archives/<sessionId>.vN.md` with an on-demand `read_file` pointer and clickable `查看归档` button on the divider card.
+  - **Web Context Watermark UI**: displays live estimated Web window context usage (`🌐 used / 60k`) in the composer `#usageBadge` and `/usage` popover with 75%/90% amber/red warnings, `#compactWebBtn` highlight, and an inline `/compact` trigger; fixed `uiMode` forwarding and `unsyncedWebTurns` shrinking on `/compact`.
+
 ## 0.7.9
 - **Web Chatbot Harness (`modes` / `approval` / `steer` / `loopGuard` / `taskState` / `contextRouter`)**:
   - Added modular `web-bridge/harness/` orchestration (`modes.mjs`, `contextRouter.mjs`, `loopGuard.mjs`, `subagentRoles.mjs`, `taskState.mjs`) enforcing `Ask` / `Accept edits` / `Plan` / `Auto` policies, Ask-mode write approval prompts, `update_plan` progress syncing, loop-guard circuit breaking, and proactive context rollover.

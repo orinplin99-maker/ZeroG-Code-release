@@ -2,14 +2,14 @@
   "publisher": "orinplin99-maker",
   "name": "zerog-code",
   "displayName": "ZeroG Code",
-  "version": "0.7.9",
+  "version": "0.7.10",
   "chromeExtensionVersion": "2.7.0",
-  "vsix": "dist/zerog-code-0.7.9.vsix",
+  "vsix": "dist/zerog-code-0.7.10.vsix",
   "chromeExtensionZip": "dist/zerog-code-chrome-extension-2.7.0.zip",
   "sha256": {
-    "dist/zerog-code-0.7.9.vsix": "d2b94d286d6dfe3f1cf5d1042260339805da01553f6b0ac64c436a5e9a45f550",
+    "dist/zerog-code-0.7.10.vsix": "e16865656f8c339082ce2c2a6d58dbc9e556dd2f2aaa96064d57b26058518e93",
     "dist/zerog-code-chrome-extension-2.7.0.zip": "e7dc2b980562cd84db81c3a577f1d400367d0239aae41161e8b71ef1a4baa93a"
   },
   "repository": "https://github.com/orinplin99-maker/ZeroG-Code-release",
-  "releasedAt": "2026-11-21T17:38:10+08:00"
+  "releasedAt": "2026-11-21T18:14:37+08:00"
 }

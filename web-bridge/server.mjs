@@ -35,9 +35,12 @@ import {
 } from './harness/loopGuard.mjs';
 import {
   loadTaskState,
+  resetTaskStateForNewChat,
+  ensureTaskGoal,
   applyUpdatePlan,
   recordTouchedFile,
   bumpContextBudget,
+  getContextBudgetSnapshot,
   shouldProactiveRollover,
   formatTaskStateForHandoff,
   toClientPlanEntries,
@@ -1706,35 +1709,33 @@ function buildSystemToolProtocol(cwd, opts = {}) {
 
   const lines = [
     '### 工作区资料协作说明',
-    `你只需输出纯文本分析。当需要我帮你${actionPhrase}时，可在回复末尾附一段 \`json:local-tool\` 数组清单，我会在下条消息把结果贴给你。工作区: \`${displayCwd}\``,
+    `仅输出纯文本分析；需${actionPhrase}时在回复末尾附 \`json:local-tool\` 数组清单。工作区: \`${displayCwd}\``,
     modePolicy.protocolRule,
     '```json:local-tool',
-    '[',
-    '  {"tool": "search_code", "args": {"pattern": "symbol", "path": "src"}},',
-    '  {"tool": "read_file", "args": {"path": "src/file.ts", "startLine": 1, "endLine": 120}}',
-    ']',
+    '[{"tool":"search_code","args":{"pattern":"sym","path":"src"}},{"tool":"read_file","args":{"path":"src/a.ts","startLine":1,"endLine":120}}]',
     '```',
-    '可用工具（连续只读项自动并行，路径支持相对路径、`~/` 或绝对路径）：',
-    '- `get_context`: `{"kind": "rules|memory|skills|index|all", "query": "建议传关键词筛选"}`（按需查询）',
-    '- `read_file`: `{"path": "...", "startLine": 1, "endLine": 250}` | `list_dir`: `{"path": "..."}` | `find_files`: `{"pattern": "*Cfg*", "path": "..."}`',
-    '- `search_code`: `{"pattern": "关键词或正则", "path": "可选目录", "glob": "*.ts", "maxCount": 80}`',
+    '可用工具（连续只读并行，路径支持相对/`~/`/绝对）：',
+    '- `get_context`: `{"kind":"rules|memory|skills|index|all","query":"关键词"}`',
+    '- `read_file`: `{"path":"...","startLine":1,"endLine":250}` | `list_dir` / `find_files`: `{"pattern":"*Cfg*","path":"..."}`',
+    '- `search_code`: `{"pattern":"词/正则","path":"目录","glob":"*.ts","maxCount":80}`',
   ];
 
   if (!modePolicy.readOnly) {
     lines.push(
-      '- `edit_file`: `{"path": "...", "target": "原文本", "replacement": "新文本"}` | `write_file`: `{"path": "...", "content": "全文"}`',
-      `- \`run_command\`: \`{"command": "${shellHint}", "cwd": "可选目录", "timeoutMs": 180000}\``
+      '- `edit_file`: `{"path":"...","target":"原文本","replacement":"新文本"}` | `write_file`: `{"path":"...","content":"全文"}`',
+      `- \`run_command\`: \`{"command":"${shellHint}","cwd":"目录","timeoutMs":180000}\``
     );
   } else {
     lines.push(
-      `- \`run_command\`: \`{"command": "仅限只读检查命令(${shellHint})", "cwd": "可选目录"}\`（Plan 模式已硬禁止 \`edit_file\`/\`write_file\` 与写命令）`
+      `- \`run_command\`: \`{"command":"只读${shellHint}","cwd":"目录"}\`（Plan 模式硬禁写文件与写命令）`
     );
   }
 
   lines.push(
-    '- `mcp_list`: `{"server": "可选服务名"}` | `mcp_call`: `{"server": "服务名", "mcpTool": "工具名", "args": {...}}`',
-    `- \`web_subagent\`: \`{"role": "researcher|reviewer|planner", "task": "目标与返回要求", "readOnly": true, "maxSteps": 4}\`（角色化独立子代理，跨模块/审查/规划可并行派最多 **${MAX_CONCURRENT_SUBAGENTS}** 个）`,
-    '约定：先查证再作答，附清单后即结束本条回复；路径统一用反引号 `` `src/file:line` ``（正斜杠）。'
+    '- `update_plan`: `{"goal":"目标","plan":[{"id":"p1","title":"步骤","status":"in_progress|completed"}],"addFinding":"发现"}`',
+    '- `mcp_list`: `{"server":"可选"}` | `mcp_call`: `{"server":"服务","mcpTool":"工具","args":{...}}`',
+    `- \`web_subagent\`: \`{"role":"researcher|reviewer|planner","task":"目标","readOnly":true,"maxSteps":4}\`（并行最多 **${MAX_CONCURRENT_SUBAGENTS}** 个）`,
+    '约定：先查证再作答，附清单即止；路径用反引号 `` `src/file:line` ``。'
   );
 
   if (contextHints) lines.push(contextHints);
@@ -2573,7 +2574,7 @@ function computeReActStepDelayMs(step, everRefused = false) {
   return base + (jitter > 0 ? Math.floor(Math.random() * jitter) : 0);
 }
 
-function buildRolloverHandoffPrompt(task) {
+function buildRolloverHandoffPrompt(task, opts = {}) {
   const protocol = buildSystemToolProtocol(task.cwd, {
     ...(task.protocolOpts || {}),
     uiMode: task.uiMode,
@@ -2582,7 +2583,14 @@ function buildRolloverHandoffPrompt(task) {
     stripInjectedUserPrefixes(task.rawUserPrompt || '').cleanText || task.rawUserPrompt || ''
   )
     .trim()
-    .slice(0, 1200);
+    .slice(0, 1400);
+
+  let taskStateBrief = typeof opts.taskStateBrief === 'string' ? opts.taskStateBrief.trim() : '';
+  if (!taskStateBrief && task.sessionId && !task.isSubagent) {
+    try {
+      taskStateBrief = formatTaskStateForHandoff(loadTaskState(task.sessionId, task.uiMode));
+    } catch (_) {}
+  }
 
   // 去重整理已执行工具记录，避免新窗口重复读相同文件
   const toolLines = [];
@@ -2598,19 +2606,29 @@ function buildRolloverHandoffPrompt(task) {
 
   const prevAnalysis = normalizeHomePathsInText(stripRawLocalToolBlocks(task.accumulatedPrefixText || ''))
     .trim()
-    .slice(-2000);
-  const recentSnippet = task.lastToolResultText
-    ? buildSanitizedRetrySummary(task.lastToolResultText, 1800, false)
-    : '';
+    .slice(-2200);
+  const latestToolBlock = typeof opts.latestToolBlock === 'string' ? opts.latestToolBlock.trim() : '';
+  const recentSnippet =
+    !latestToolBlock && task.lastToolResultText
+      ? buildSanitizedRetrySummary(task.lastToolResultText, 2400, false)
+      : '';
+
+  const introLine =
+    opts.reason === 'proactive'
+      ? '原对话窗口已达到上下文预算阈值，已主动保存任务状态并切换到新的干净窗口无损续跑。请基于以下摘要与最新一批资料直接推进剩余分析或修改，避免重复读取已列出的相同范围。'
+      : '刚才的对话窗口因内容较长中断，已切换到新的干净窗口续接。请基于以下摘要直接推进剩余分析或修改，避免重复读取已列出的相同范围。';
 
   const sections = [
     protocol,
     '',
     '### 续接前序任务摘要',
-    '刚才的对话窗口因内容较长中断，已切换到新的干净窗口续接。请基于以下摘要直接推进剩余分析或修改，避免重复读取已列出的相同范围。',
+    introLine,
   ];
   if (rawQuestion) {
     sections.push('', '#### 原始需求', rawQuestion);
+  }
+  if (taskStateBrief) {
+    sections.push('', '#### 任务状态与关键发现', taskStateBrief);
   }
   if (toolLines.length) {
     sections.push('', `#### 已查阅与操作记录 (${toolLines.length} 项)`, toolLines.join('\n'));
@@ -2618,12 +2636,21 @@ function buildRolloverHandoffPrompt(task) {
   if (prevAnalysis) {
     sections.push('', '#### 已有阶段性分析', prevAnalysis);
   }
-  if (recentSnippet) {
+  if (opts.steerBlock) {
+    sections.push('', String(opts.steerBlock).trim());
+  }
+  if (opts.loopGuardDirective) {
+    sections.push('', String(opts.loopGuardDirective).trim());
+  }
+  if (latestToolBlock) {
+    sections.push('', latestToolBlock);
+  } else if (recentSnippet) {
     sections.push('', '#### 最近一批补充资料摘录', '```text', recentSnippet, '```');
   }
   sections.push(
     '',
-    '请承接以上进展继续完成任务：若还需补充查证或修改，建议本次仅附 1~2 个精简的 `json:local-tool` 清单；若已有足够信息，请直接给出纯文本最终结论（路径用反引号 `` `path:line` ``）。'
+    opts.nextStepInstruction ||
+      '请承接以上进展继续完成任务：若还需补充查证或修改，建议本次仅附 1~2 个精简的 `json:local-tool` 清单；若已有足够信息，请直接给出纯文本最终结论（路径用反引号 `` `path:line` ``）。'
   );
   return sections.join('\n');
 }
@@ -2979,6 +3006,147 @@ async function runWebSubagentTool(args, workCwd, execContext = {}) {
   }
 }
 
+/**
+ * 轻量模型语义压缩（默认使用 4 Hydrogen / Flash low 档位，独立后台页签用完即关，不消耗高配主模型额度）：
+ * 将长达 25k~32k 字的增量对话记录蒸馏成 4k~8k 字的 6 段结构化交接简报；
+ * 任何离线、拒答或超时异常均安全返回 fallback: true，由调用方无感降级为本地确定性压缩。
+ */
+async function runWebCompactSummarizer({
+  sessionId = '',
+  cwd = DEFAULT_CWD,
+  sourceText = '',
+  focus = '',
+  targetMaxChars = 6500,
+  model = '',
+  timeoutMs = 45000,
+} = {}) {
+  const cleanSource = normalizeHomePathsInText(String(sourceText || '').trim()).slice(0, 34000);
+  if (!cleanSource) {
+    return { ok: false, fallback: true, error: '待压缩内容为空' };
+  }
+  if (!isBrowserOnline()) {
+    return { ok: false, fallback: true, error: '浏览器扩展离线，自动降级为本地确定性压缩' };
+  }
+
+  const resolvedModel =
+    String(model || '')
+      .trim()
+      .replace(/^web:/i, '')
+      .trim() || pickDefaultSubagentModel('');
+  const safeTimeout = Math.max(12000, Math.min(90000, Number(timeoutMs || 45000)));
+  const safeTarget = Math.max(2500, Math.min(12000, Number(targetMaxChars || 6500)));
+
+  const slotAcquired = await acquireSubagentSlot(null);
+  if (!slotAcquired) {
+    return { ok: false, fallback: true, error: '未获取到后台压缩并发槽位' };
+  }
+
+  const rand = Math.random().toString(36).slice(2, 7);
+  const parentShort = String(sessionId || 'root').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 12) || 'root';
+  const reqId = `wb_cmp_${Date.now()}_${rand}`;
+  const subSessionId = `cmp_${parentShort}_${Date.now().toString(36)}_${rand}`;
+  const startedAt = Date.now();
+
+  const summaryPrompt = [
+    '你是一名资深软件工程上下文整理助手。请把下面的开发对话增量记录精炼为一份高密度、可直接交给下一个干净对话窗口无缝续接的 Markdown 交接简报。',
+    '要求：',
+    `- 总长度严格控制在 ${safeTarget} 字符以内，信息密度要高，删除寒暄、重复试错和无关过程，只保留对后续开发有决定性价值的事实。`,
+    '- 严禁编造原文未出现的文件名、函数名、行号或结论；路径统一用反引号 `` `path:line` ``。',
+    '- 严禁输出任何工具调用 JSON 代码块，直接输出纯 Markdown 正文。',
+    '- 按以下 6 个固定小节组织（某节确实无内容可写“无”）：',
+    '  1. `#### 1. 核心目标与范围`',
+    '  2. `#### 2. 已确认的决策、规则与约束`',
+    '  3. `#### 3. 已修改或关键涉及的文件与行号`',
+    '  4. `#### 4. 关键发现与已排除的坑点`',
+    '  5. `#### 5. 未解决的问题 / 风险阻塞`',
+    '  6. `#### 6. 下一步待办`',
+    focus ? `- 特别关注用户指定的保留重点：${normalizeHomePathsInText(focus)}` : '',
+    '',
+    '---',
+    '待整理的前序增量对话与状态如下：',
+    '',
+    cleanSource,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const cmpTask = {
+    requestId: reqId,
+    sessionId: subSessionId,
+    isSubagent: true,
+    parentRequestId: '',
+    subagentRole: 'compact_summarizer',
+    readOnly: true,
+    childRequestIds: new Set(),
+    cwd: cwd || state.cwd || DEFAULT_CWD,
+    protocolOpts: {},
+    rawUserPrompt: summaryPrompt,
+    newChat: true,
+    webChatUrl: '',
+    webCursor: null,
+    autoCloseTab: true,
+    serverReAct: false,
+    maxSteps: 1,
+    step: 0,
+    images: null,
+    webModel: resolvedModel,
+    webEffort: 'low',
+    currentStepPrompt: summaryPrompt,
+    accumulatedPrefixText: '',
+    currentStepText: '',
+    bestStepText: '',
+    lastToolResultText: '',
+    lastCallSig: '',
+    sameCallStreak: 0,
+    refusalRetries: 0,
+    falseLimitRetries: 0,
+    text: '',
+    thoughts: '',
+    tools: [],
+    status: 'queued',
+    error: null,
+    dispatched: false,
+    sentAt: 0,
+    wasDispatchedBeforeCancel: false,
+    cancelDispatched: false,
+    createdAt: startedAt,
+    updatedAt: startedAt,
+  };
+
+  webTasks.set(reqId, cmpTask);
+  log(`[WebCompact] 启动轻量语义压缩 requestId=${reqId} model=${resolvedModel} inputChars=${cleanSource.length}`);
+
+  let closeDelayMs = 0;
+  try {
+    while (true) {
+      if (cmpTask.status === 'completed') {
+        closeDelayMs = 800;
+        const rawOut = normalizeHomePathsInText(stripRawLocalToolBlocks(cmpTask.text || cmpTask.bestStepText || '')).trim();
+        const elapsedMs = Date.now() - startedAt;
+        if (!rawOut || rawOut.length < 100 || isCannedRefusalReply(rawOut) || isTransientErrorReply(rawOut)) {
+          log(`[WebCompact] 轻量压缩输出不可用 (len=${rawOut.length})，降级本地确定性压缩`);
+          return { ok: false, fallback: true, error: '轻量模型返回内容不完整或触发拦截' };
+        }
+        const clipped = rawOut.length > safeTarget + 800 ? rawOut.slice(0, safeTarget + 800).trim() : rawOut;
+        log(`[WebCompact] 轻量语义压缩完成 requestId=${reqId} model=${resolvedModel} outChars=${clipped.length} elapsed=${elapsedMs}ms`);
+        return { ok: true, summary: clipped, model: resolvedModel, elapsedMs };
+      }
+      if (cmpTask.status === 'error' || cmpTask.status === 'cancelled') {
+        return { ok: false, fallback: true, error: cmpTask.error || '轻量模型压缩中断' };
+      }
+      if (Date.now() - startedAt > safeTimeout) {
+        cancelWebTaskTree(cmpTask);
+        log(`[WebCompact] 轻量语义压缩超时 (${Math.round(safeTimeout / 1000)}s)，降级本地压缩`);
+        return { ok: false, fallback: true, error: `轻量模型压缩超时 (${Math.round(safeTimeout / 1000)}s)` };
+      }
+      await new Promise((r) => setTimeout(r, 220));
+    }
+  } finally {
+    releaseSubagentSlot();
+    scheduleSubagentTabClose(subSessionId, cmpTask.webChatUrl, closeDelayMs);
+  }
+}
+
 async function runReActToolStep(task, parsedCall) {
   const callSig = JSON.stringify(parsedCall);
   if (callSig === task.lastCallSig) {
@@ -3034,6 +3202,7 @@ async function runReActToolStep(task, parsedCall) {
     return;
   }
 
+  const prevStepReplyChars = String(task.currentStepText || '').length;
   task.lastToolResultText = sanitizeToolOutputForWeb(String(toolResultText || '')).slice(0, 24500);
   task.accumulatedPrefixText = task.text + '\n\n';
   task.currentStepText = '';
@@ -3106,18 +3275,21 @@ async function runReActToolStep(task, parsedCall) {
   let proactiveRolloverTriggered = false;
   if (!task.isSubagent && !isFinal && task.webChatUrl) {
     try {
-      const charsDelta = String(task.lastToolResultText || '').length + String(task.currentStepText || '').length;
+      const charsDelta = String(task.lastToolResultText || '').length + prevStepReplyChars;
       const st = bumpContextBudget(task.sessionId, { stepDelta: 1, charsDelta, mode: task.uiMode });
       const rolloverCheck = shouldProactiveRollover(st);
-      if (rolloverCheck.needed && !task.proactiveRolledOver) {
+      if (rolloverCheck.needed) {
         proactiveRolloverTriggered = true;
         task.proactiveRolledOver = true;
+        task.hasAutoRolledOver = true;
+        task.proactiveRolloverCount = (task.proactiveRolloverCount || 0) + 1;
         task.rolledOverFromWebChatUrl = task.webChatUrl;
         task.forceNewChatNextDispatch = true;
         task.webChatUrl = '';
         task.webCursor = null;
         const resetSt = bumpContextBudget(task.sessionId, { resetTabBudget: true, mode: task.uiMode });
         const handoffBrief = formatTaskStateForHandoff(resetSt);
+        task.rolledOverSummary = handoffBrief;
         task.thoughts = [
           task.thoughts,
           `🔄 上下文预算达到主动换页阈值（${rolloverCheck.reason}），已自动保存进度并切换全新网页页签无损续跑…`,
@@ -3127,20 +3299,22 @@ async function runReActToolStep(task, parsedCall) {
           step: task.step,
           reason: rolloverCheck.reason,
           oldUrl: task.rolledOverFromWebChatUrl,
+          rolloverIndex: task.proactiveRolloverCount,
         });
-        task.currentStepPrompt = [
-          buildSystemToolProtocol(task.cwd, task.protocolOpts || {}),
-          '---',
-          handoffBrief ? `### 前序任务交接简报
-${handoffBrief}` : '',
-          steerRes.block || '',
-          loopGuardRes.triggered ? loopGuardRes.directive : '',
-          `### 最新一批工作区资料（第 ${task.step} 批${headerSuffix}）`,
+        const latestToolBlock = [
+          `#### 最新一批工作区资料（第 ${task.step} 批${headerSuffix}）`,
           '```text',
           task.lastToolResultText,
           '```',
+        ].join('\n');
+        task.currentStepPrompt = buildRolloverHandoffPrompt(task, {
+          reason: 'proactive',
+          taskStateBrief: handoffBrief,
+          steerBlock: steerRes.block || '',
+          loopGuardDirective: loopGuardRes.triggered ? loopGuardRes.directive : '',
+          latestToolBlock,
           nextStepInstruction,
-        ].filter(Boolean).join('\n\n');
+        });
       }
     } catch (_) {}
   }
@@ -3839,7 +4013,15 @@ const server = http.createServer(async (req, res) => {
                 task.forceNewChatNextDispatch = true;
                 task.webChatUrl = '';
                 task.webCursor = null;
-                task.currentStepPrompt = buildRolloverHandoffPrompt(task);
+                let resetSt = null;
+                try {
+                  resetSt = bumpContextBudget(task.sessionId, { resetTabBudget: true, mode: task.uiMode });
+                  task.rolledOverSummary = formatTaskStateForHandoff(resetSt);
+                } catch (_) {}
+                task.currentStepPrompt = buildRolloverHandoffPrompt(task, {
+                  reason: 'refusal',
+                  taskStateBrief: task.rolledOverSummary || '',
+                });
                 task.thoughts = [
                   task.thoughts,
                   '🔄 原网页窗口连续触发中断限制，已自动压缩前序进展并切换到全新窗口继续…',
@@ -3926,6 +4108,12 @@ const server = http.createServer(async (req, res) => {
             task.lastProgressAt = Date.now();
             task.updatedAt = Date.now();
             return sendJson(res, 200, { ok: true, retryingFalseLimit: true });
+          }
+
+          if (!task.isSubagent && stepReply) {
+            try {
+              bumpContextBudget(task.sessionId, { charsDelta: stepReply.length, mode: task.uiMode });
+            } catch (_) {}
           }
 
           task.status = 'completed';
@@ -4053,6 +4241,35 @@ const server = http.createServer(async (req, res) => {
           ? `${modeChangeNotice}\n\n${rawPrompt}`
           : rawPrompt;
 
+      // 精确同步本地会话上下文预算：
+      // - newChat 且 preserveTaskState（如 /compact 切新窗）仅清零当前窗口预算，保留长期 goal/plan/touchedFiles；
+      // - 纯新会话 newChat 清空任务状态机；
+      // - 每轮用户输入（无论是否触发工具调用）均计入 turnCount 与 approxChars，并自动回填缺失的 goal。
+      try {
+        if (newChat) {
+          if (body.preserveTaskState) {
+            bumpContextBudget(targetSessionId, {
+              resetTabBudget: true,
+              countRollover: Boolean(body.countRollover),
+              mode: uiMode,
+            });
+          } else {
+            resetTaskStateForNewChat(targetSessionId, uiMode);
+          }
+        }
+        const strippedGoal = stripInjectedUserPrefixes(rawPrompt).cleanText || rawPrompt;
+        const lazyUserMatch = strippedGoal.match(/以下是用户在新窗口中的最新请求：\s*\n+([\s\S]+)$/);
+        const effectiveGoalText = lazyUserMatch ? lazyUserMatch[1].trim() : strippedGoal.trim();
+        if (effectiveGoalText && !/^【上下文压缩交接】/.test(effectiveGoalText)) {
+          ensureTaskGoal(targetSessionId, effectiveGoalText, uiMode);
+        }
+        bumpContextBudget(targetSessionId, {
+          turnDelta: 1,
+          charsDelta: firstPrompt.length,
+          mode: uiMode,
+        });
+      } catch (_) {}
+
       // 若同一对话栏此前有残留未结任务，仅替换清理本会话的旧任务（含其派生子代理），避免阻塞本会话新消息且不影响其它对话栏
       if (body.sessionId) {
         for (const oldTask of webTasks.values()) {
@@ -4104,7 +4321,9 @@ const server = http.createServer(async (req, res) => {
         forceNewChatNextDispatch: false,
         hasAutoRolledOver: false,
         proactiveRolledOver: false,
+        proactiveRolloverCount: 0,
         rolledOverFromWebChatUrl: '',
+        rolledOverSummary: '',
         steerQueue: [],
         loopGuard: createLoopGuardState(),
         pendingApproval: null,
@@ -4147,6 +4366,12 @@ const server = http.createServer(async (req, res) => {
       if (!task) {
         return sendJson(res, 404, { ok: false, error: '未找到对应的 WebBrain 任务' });
       }
+      let contextBudget = null;
+      if (!task.isSubagent && task.sessionId) {
+        try {
+          contextBudget = getContextBudgetSnapshot(loadTaskState(task.sessionId, task.uiMode));
+        } catch (_) {}
+      }
       return sendJson(res, 200, {
         ok: true,
         requestId: task.requestId,
@@ -4157,9 +4382,11 @@ const server = http.createServer(async (req, res) => {
         tools: task.tools,
         webChatUrl: task.webChatUrl || '',
         webCursor: task.webCursor || null,
-        autoRolledOver: Boolean(task.hasAutoRolledOver),
+        autoRolledOver: Boolean(task.hasAutoRolledOver || task.proactiveRolledOver),
         proactiveRolledOver: Boolean(task.proactiveRolledOver),
         rolledOverFromWebChatUrl: task.rolledOverFromWebChatUrl || '',
+        rolledOverSummary: task.rolledOverSummary || '',
+        contextBudget,
         planEntries: Array.isArray(task.planEntries) ? task.planEntries : [],
         pendingApproval: task.pendingApproval || null,
         steerQueueCount: Array.isArray(task.steerQueue) ? task.steerQueue.length : 0,
@@ -4167,6 +4394,59 @@ const server = http.createServer(async (req, res) => {
         browserOnline: isBrowserOnline(),
         webModelState,
       });
+    }
+
+    // 6.0a 查询当前会话的 Web 上下文预算与任务状态快照 (/web-brain/context-budget)
+    if (req.method === 'GET' && pathname === '/web-brain/context-budget') {
+      const sid = String(parsedUrl.searchParams.get('sessionId') || '').trim();
+      if (!sid) return sendJson(res, 400, { ok: false, error: 'sessionId 不能为空' });
+      const st = loadTaskState(sid);
+      return sendJson(res, 200, {
+        ok: true,
+        sessionId: sid,
+        contextBudget: getContextBudgetSnapshot(st),
+        taskState: {
+          goal: st.goal || '',
+          plan: st.plan || [],
+          touchedFiles: st.touchedFiles || [],
+          keyFindings: st.keyFindings || [],
+        },
+        browserOnline: isBrowserOnline(),
+      });
+    }
+
+    // 6.0b 重置指定会话的当前网页窗口上下文预算 (/web-brain/context-budget/reset)
+    if (req.method === 'POST' && pathname === '/web-brain/context-budget/reset') {
+      const body = await readJsonBody(req).catch(() => ({}));
+      const sid = String(body.sessionId || '').trim();
+      if (!sid) return sendJson(res, 400, { ok: false, error: 'sessionId 不能为空' });
+      const st = body.clearTaskState
+        ? resetTaskStateForNewChat(sid, normalizeUiMode(body.uiMode))
+        : bumpContextBudget(sid, {
+            resetTabBudget: true,
+            countRollover: Boolean(body.countRollover),
+            mode: body.uiMode ? normalizeUiMode(body.uiMode) : undefined,
+          });
+      return sendJson(res, 200, {
+        ok: true,
+        sessionId: sid,
+        contextBudget: getContextBudgetSnapshot(st),
+      });
+    }
+
+    // 6.0c 轻量模型语义压缩端点 (/web-brain/summarize-compact)：用低成本后台页签提炼结构化交接摘要，不占主模型额度
+    if (req.method === 'POST' && pathname === '/web-brain/summarize-compact') {
+      const body = await readJsonBody(req).catch(() => ({}));
+      const result = await runWebCompactSummarizer({
+        sessionId: String(body.sessionId || ''),
+        cwd: body.cwd || state.cwd || DEFAULT_CWD,
+        sourceText: String(body.sourceText || ''),
+        focus: String(body.focus || ''),
+        targetMaxChars: Number(body.targetMaxChars || 6500),
+        model: String(body.model || ''),
+        timeoutMs: Number(body.timeoutMs || 45000),
+      });
+      return sendJson(res, 200, result);
     }
 
     // 6.1 网页端用量（本机记账 + 限额提示）
