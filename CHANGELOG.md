@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.9
+- **Web Chatbot Harness (`modes` / `approval` / `steer` / `loopGuard` / `taskState` / `contextRouter`)**:
+  - Added modular `web-bridge/harness/` orchestration (`modes.mjs`, `contextRouter.mjs`, `loopGuard.mjs`, `subagentRoles.mjs`, `taskState.mjs`) enforcing `Ask` / `Accept edits` / `Plan` / `Auto` policies, Ask-mode write approval prompts, `update_plan` progress syncing, loop-guard circuit breaking, and proactive context rollover.
+  - Added live **⚡ Steer** mid-run course-correction in the VS Code chat queue (`media/chat.js`, `src/chatPanel.js`, `src/webBrainClient.js`, `POST /web-brain/steer`).
+- **Web-Only Session Fallback & Graceful Bridge Restart**:
+  - Automatically opens a standalone Web-only session when `agy` CLI is not installed or not signed in (`src/chatPanel.js`).
+  - Hardened `restartWebBridge` with native-only `POST /admin/shutdown`, port-release wait, `start-bridge.ps1 -Force`, and `/status` PID switch verification.
+- **macOS/Linux Deployment & Local Bridge Origin Lock**:
+  - Added `skills/zerog-code-deploy/scripts/deploy.sh`, `web-bridge/start-bridge.sh`, and `web-bridge/stop-bridge.sh` (with `web-bridge/harness/` deployment).
+  - Tightened `web-bridge/server.mjs` CORS/origin checks (native no-Origin, `chrome-extension://`, `https://gemini.google.com`, plus configurable `allowedOrigins`) and enforced `application/json` on `POST` requests.
+- **Optional trusted input (`chrome.debugger`) for the new Gemini UI (`v2.7.0` Chrome Extension, off by default)**:
+  - The current Gemini page ignores `isTrusted=false` click and Enter events, so the Web channel could fill the composer but never send. Adds an explicit opt-in **可信发送** toggle (default OFF to avoid triggering Chrome debugger infobars or automation signals unless needed). When enabled, sends escalate on outcome: synthetic click first, one failed attempt upgrades to `chrome.debugger` (`Input.dispatchMouseEvent`, then `Input.dispatchKeyEvent`), one confirmed delivery on that composer signature makes trusted the default, and two consecutive trusted failures demote it back to probing. The profile is stored in `chrome.storage.local` and keyed by the composer signature, so a Gemini UI change re-probes automatically. Adds the `debugger` permission; Chrome shows its "debugging this browser" infobar while a send is in flight.
+  - Panel header now reads its version from the manifest instead of a hard-coded string, and shows a `⚡可信发送` badge once the page is known to need trusted input.
+
 ## 0.7.8
 - **Faster Parallel `web_subagent` Orchestration & Tab-Lag Protection (`v2.6.8` Chrome Extension + Web Bridge)**:
   - Lowered default `MAX_CONCURRENT_SUBAGENTS` from `3` to `2` (still configurable via `WEB_SUBAGENT_CONCURRENCY`) to prevent Chrome lag from excessive concurrent Gemini tabs while auto-closing finished tabs immediately (`web-bridge/server.mjs`).

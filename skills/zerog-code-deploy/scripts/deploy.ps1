@@ -284,10 +284,18 @@ if (-not $SkipWebBridge) {
   }
 
   Info "Deploying Web Bridge & Chrome Extension to $bridgeDst (preserving user state/config)..."
-  foreach ($f in @('server.mjs', 'mcp-server.mjs', 'start-bridge.ps1', 'stop-bridge.ps1', 'README.md')) {
+  foreach ($f in @('server.mjs', 'mcp-server.mjs', 'start-bridge.ps1', 'stop-bridge.ps1', 'README.md', 'CHATBOT_HARNESS_DESIGN.md')) {
     $srcFile = Join-Path $bridgeSrc $f
     if (Test-Path $srcFile) {
       Copy-Item -Path $srcFile -Destination (Join-Path $bridgeDst $f) -Force
+    }
+  }
+  $harnessSrc = Join-Path $bridgeSrc 'harness'
+  if (Test-Path $harnessSrc) {
+    $harnessDst = Join-Path $bridgeDst 'harness'
+    New-Item -ItemType Directory -Force $harnessDst | Out-Null
+    Get-ChildItem -Path $harnessSrc -File | ForEach-Object {
+      Copy-Item -Path $_.FullName -Destination (Join-Path $harnessDst $_.Name) -Force
     }
   }
   # Bundle shared MCP helpers alongside server.mjs so Web Bridge never needs to scan editor extension folders

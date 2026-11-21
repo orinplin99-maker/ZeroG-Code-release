@@ -2,9 +2,9 @@
 
 本文档覆盖 **ZeroG Code** 全栈 4 大组件的完整安装、配置与验证步骤：
 1. **Antigravity CLI (`agy`)** — 本地 CLI 引擎底座
-2. **ZeroG Code 插件（VS Code / Cursor）** — 预打包文件 [`dist/zerog-code-0.7.8.vsix`](dist/zerog-code-0.7.8.vsix)
+2. **ZeroG Code 插件（VS Code / Cursor）** — 预打包文件 [`dist/zerog-code-0.7.9.vsix`](dist/zerog-code-0.7.9.vsix)
 3. **本地 Web Bridge 守护进程 + MCP 服务** — [`web-bridge/`](web-bridge/)（运行于 `http://127.0.0.1:18765`）
-4. **Chrome MV3 浏览器拓展（`ZeroG Code — Gemini Web Bridge`）** — 预打包文件 [`dist/zerog-code-chrome-extension-2.6.8.zip`](dist/zerog-code-chrome-extension-2.6.8.zip)（解压源码同见 [`web-bridge/chrome-extension/`](web-bridge/chrome-extension/)）
+4. **Chrome MV3 浏览器拓展（`ZeroG Code — Gemini Web Bridge`）** — 预打包文件 [`dist/zerog-code-chrome-extension-2.7.0.zip`](dist/zerog-code-chrome-extension-2.7.0.zip)（解压源码同见 [`web-bridge/chrome-extension/`](web-bridge/chrome-extension/)）
 
 > 发布仓库（公开）：[https://github.com/orinplin99-maker/ZeroG-Code-release](https://github.com/orinplin99-maker/ZeroG-Code-release) · 源码仓库：[https://github.com/orinplin99-maker/ZeroG-Code](https://github.com/orinplin99-maker/ZeroG-Code)
 
@@ -20,6 +20,8 @@
 | **Google Chrome** | 需登录可用 `https://gemini.google.com` 的账号（仅 Web 通道需要） | 官网安装 |
 | **Antigravity CLI (`agy`)** | 需安装并完成浏览器登录 | `irm https://antigravity.google/cli/install.ps1 \| iex` |
 
+> macOS / Linux 用官方 shell 安装器：`curl -fsSL https://antigravity.google/cli/install.sh | bash`，装到 `~/.local/bin/agy`；Node.js 用 `brew install node`。
+
 ---
 
 ## 二、预打包产物清单（开箱即用，无需编译）
@@ -28,8 +30,8 @@
 
 | 产物路径 | 组件 | 版本 | 用途 |
 |---|---|---|---|
-| `dist/zerog-code-0.7.8.vsix` | ZeroG Code VS Code / Cursor 插件 | `0.7.8` | 离线安装到 VS Code / Cursor（Extension ID：`orinplin99-maker.zerog-code`） |
-| `dist/zerog-code-chrome-extension-2.6.8.zip` | ZeroG Code — Gemini Web Bridge Chrome 拓展 | `2.6.8` | 解压后在 Chrome `chrome://extensions/` 加载 |
+| `dist/zerog-code-0.7.9.vsix` | ZeroG Code VS Code / Cursor 插件 | `0.7.9` | 离线安装到 VS Code / Cursor（Extension ID：`orinplin99-maker.zerog-code`） |
+| `dist/zerog-code-chrome-extension-2.7.0.zip` | ZeroG Code — Gemini Web Bridge Chrome 拓展 | `2.7.0` | 解压后在 Chrome `chrome://extensions/` 加载 |
 | `skills/zerog-code-deploy/` | AI Agent 自动化部署 Skill | 最新 | 交给 Antigravity / Claude Code 一键全自动部署 |
 
 ---
@@ -73,6 +75,30 @@ powershell -ExecutionPolicy Bypass -File .\skills\zerog-code-deploy\scripts\depl
 
 ---
 
+### 方式 2b：macOS / Linux 一键脚本部署
+
+`deploy.ps1` 是 Windows 专用；macOS / Linux 用同目录下的 `deploy.sh`，步骤与参数一一对应：
+
+```bash
+# 标准全栈部署到 VS Code（缺少 agy 时自动安装 + 安装预打包 VSIX + 部署并启动 Web Bridge + 注册 MCP）
+./skills/zerog-code-deploy/scripts/deploy.sh --install-skill
+
+# 同时装入 VS Code 和 Cursor
+./skills/zerog-code-deploy/scripts/deploy.sh --editor code,cursor --install-skill
+
+# 仅更新 Web Bridge 与 Chrome 拓展
+./skills/zerog-code-deploy/scripts/deploy.sh --skip-vscode --skip-auth-check
+```
+
+与 PowerShell 版的差异只有两处：`--use-prebuilt` 不需要（仓库里只有预打包 VSIX 时自动选用），`--editor` 默认 `code`。升级与保活行为保持一致：更新前先停旧 Web Bridge，且不覆盖 `state.json`、`web_usage.json`、`LOCAL_TOOL_INDEX.md`、`bridge.config.json`。
+
+Web Bridge 在 macOS / Linux 上由 `web-bridge/start-bridge.sh` / `stop-bridge.sh` 管理（`nohup` 脱离终端，`Reload Window` 不会杀掉进程）：
+
+```bash
+~/.gemini/web-bridge/start-bridge.sh --cwd "$PWD"
+~/.gemini/web-bridge/stop-bridge.sh
+```
+
 ### 方式 3：纯手动离线部署（使用 `dist/` 预打包文件）
 
 #### 1) 安装并登录 Antigravity CLI (`agy`)
@@ -85,12 +111,12 @@ agy
 #### 2) 安装 ZeroG Code 插件（VS Code / Cursor）
 ```powershell
 # VS Code
-code --install-extension .\dist\zerog-code-0.7.8.vsix --force
+code --install-extension .\dist\zerog-code-0.7.9.vsix --force
 
 # Cursor（可选）
-cursor --install-extension .\dist\zerog-code-0.7.8.vsix --force
+cursor --install-extension .\dist\zerog-code-0.7.9.vsix --force
 ```
-也可在 VS Code 左侧 **Extensions** 面板右上角 `...` → **Install from VSIX...** 中选择 `dist/zerog-code-0.7.8.vsix`。
+也可在 VS Code 左侧 **Extensions** 面板右上角 `...` → **Install from VSIX...** 中选择 `dist/zerog-code-0.7.9.vsix`。
 
 #### 3) 部署并启动本地 Web Bridge 与 MCP 服务
 ```powershell
@@ -101,7 +127,7 @@ New-Item -ItemType Directory -Force "$bridgeDst\chrome-extension" | Out-Null
 Copy-Item .\web-bridge\server.mjs, .\web-bridge\mcp-server.mjs, .\web-bridge\start-bridge.ps1, .\web-bridge\stop-bridge.ps1, .\web-bridge\README.md $bridgeDst -Force
 
 # 解压最新 Chrome 拓展包到运行时目录
-Expand-Archive -Path .\dist\zerog-code-chrome-extension-2.6.8.zip -DestinationPath "$bridgeDst\chrome-extension" -Force
+Expand-Archive -Path .\dist\zerog-code-chrome-extension-2.7.0.zip -DestinationPath "$bridgeDst\chrome-extension" -Force
 
 # 后台独立启动 Web Bridge（监听 127.0.0.1:18765，VS Code Reload Window 不会杀掉）
 & "$bridgeDst\start-bridge.ps1"
@@ -134,7 +160,7 @@ Expand-Archive -Path .\dist\zerog-code-chrome-extension-2.6.8.zip -DestinationPa
    ```text
    %USERPROFILE%\.gemini\web-bridge\chrome-extension
    ```
-   > 也可以把 `dist/zerog-code-chrome-extension-2.6.8.zip` 解压到任意固定目录后选择该目录。
+   > 也可以把 `dist/zerog-code-chrome-extension-2.7.0.zip` 解压到任意固定目录后选择该目录。
    > 若此前已加载过旧版拓展，覆盖文件后只需在拓展卡片上点击 **刷新 ↻** 即可。
 4. 在 Chrome 中打开 `https://gemini.google.com` 并确保已登录。
 
@@ -145,7 +171,7 @@ Expand-Archive -Path .\dist\zerog-code-chrome-extension-2.6.8.zip -DestinationPa
 完成上述步骤后，运行以下两条校验命令：
 
 ```powershell
-# 1. 验证 VS Code 插件版本（应为 orinplin99-maker.zerog-code@0.7.8，且无旧版残留）
+# 1. 验证 VS Code 插件版本（应为 orinplin99-maker.zerog-code@0.7.9，且无旧版残留）
 code --list-extensions --show-versions | Select-String "zerog-code|ccweb|antigravity-tabs"
 
 # 2. 验证本地 Web Bridge 与 Chrome 拓展实时握手
@@ -153,7 +179,7 @@ Invoke-RestMethod http://127.0.0.1:18765/status | Select-Object ok, browserOnlin
 ```
 
 预期正常输出：
-- `orinplin99-maker.zerog-code@0.7.8`
+- `orinplin99-maker.zerog-code@0.7.9`
 - `ok: True` 且 `browserOnline: True`
 
 随后在 VS Code / Cursor 中：

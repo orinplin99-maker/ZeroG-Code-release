@@ -31,6 +31,13 @@
   window.__AGWB_CONTENT_STATE__ = contentStateHandle;
 
   let autoLoop = false; // 默认关闭页面自闭环，避免与 VS Code 服务端 ReAct 循环争抢
+  // 发送策略（按输入框特征记忆）：默认仅走合成点击，不触发 chrome.debugger；
+  // 仅当用户显式开启「可信发送」开关后，才允许合成失败时升级 chrome.debugger 并记忆该特征。
+  const SEND_PROFILE_KEY = 'agwb_send_profile';
+  const TRUSTED_SEND_ENABLED_KEY = 'agwb_allow_trusted_send';
+  let allowTrustedSend = false;
+  let sendProfile = { preferTrusted: false, strikes: 0, sig: '' };
+  let lastSendAttempt = 'synthetic';
   let localEngine = 'local-tool';
   let isBridgeBusy = false;
   let isManagedByBridge = false; // 仅由 background 标记或收到 EXEC_WEB_COMMAND 的受管页签才会主动发现模型/上报全局状态
@@ -478,6 +485,178 @@
     return await waitForPreviewIncrease(baseline, 1200);
   }
 
+  // 新版 Gemini 忽略合成点击/回车，只有 chrome.debugger 发出的真实输入才生效
+  function requestTrustedInput(payload) {
+    return new Promise((resolve) => {
+      try {
+        if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+          return resolve({ ok: false, error: 'no runtime' });
+        }
+        chrome.runtime.sendMessage({ type: 'TRUSTED_INPUT', ...payload }, (res) => {
+          if (chrome.runtime.lastError) {
+            return resolve({ ok: false, error: chrome.runtime.lastError.message });
+          }
+          const out = res || { ok: false, error: 'no response' };
+          if (!out.ok) {
+            const el = document.getElementById('agwb-status');
+            if (el) el.textContent = `⚠️ 可信输入失败(${payload.kind}): ${String(out.error || '').slice(0, 60)}`;
+            console.warn('[AGWB] trusted input failed:', payload.kind, out.error);
+          }
+          resolve(out);
+        });
+      } catch (err) {
+        resolve({ ok: false, error: String(err) });
+      }
+    });
+  }
+
+  // 发送按钮候选：最近命中的选择器提到最前，只记在本次会话（不落盘、不跨改版）
+  const SEND_BTN_SELECTORS = [
+    'button.send-button:not([disabled])',
+    'button[aria-label*="Send"]:not([disabled])',
+    'button[aria-label*="发送"]:not([disabled])',
+    '.send-button-container button:not([disabled])',
+  ];
+  let sendBtnSelectorHint = '';
+
+  function findEnabledSendBtn() {
+    const order = sendBtnSelectorHint
+      ? [sendBtnSelectorHint, ...SEND_BTN_SELECTORS.filter((sel) => sel !== sendBtnSelectorHint)]
+      : SEND_BTN_SELECTORS;
+    for (const sel of order) {
+      const el = document.querySelector(sel);
+      if (el && el.getAttribute('aria-disabled') !== 'true') {
+        sendBtnSelectorHint = sel;
+        return el;
+      }
+    }
+    return null;
+  }
+
+  async function trustedSend(editor) {
+    const btn = findEnabledSendBtn();
+    if (btn) {
+      const r = btn.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        const res = await requestTrustedInput({
+          kind: 'click',
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+        });
+        if (res.ok) return true;
+      }
+    }
+    const fallback = await requestTrustedInput({ kind: 'enter' });
+    return Boolean(fallback.ok);
+  }
+
+  function getExtVersion() {
+    try {
+      return (chrome?.runtime?.getManifest?.() || {}).version || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function currentComposerSig() {
+    const ed = findGeminiEditor();
+    if (!ed) return '';
+    return [String(ed.className || ''), ed.getAttribute('role') || ''].join('|').slice(0, 120);
+  }
+
+  function updatePanelMeta() {
+    const verEl = document.getElementById('agwb-ver');
+    if (verEl) {
+      const v = getExtVersion();
+      verEl.textContent = `ZeroG Code Bridge${v ? ' v' + v : ''}`;
+    }
+    const trustedChk = document.getElementById('agwb-trusted');
+    if (trustedChk) trustedChk.checked = Boolean(allowTrustedSend);
+    const modeEl = document.getElementById('agwb-sendmode');
+    if (modeEl) {
+      const on = Boolean(allowTrustedSend && sendProfile.preferTrusted);
+      modeEl.textContent = on ? '⚡可信中' : '';
+      modeEl.title = allowTrustedSend
+        ? (on
+          ? '已开启可信发送：当前页面直接使用 chrome.debugger 真实点击'
+          : '已开启可信发送：优先合成点击，失败一次后升级 chrome.debugger')
+        : '可信发送已关闭（默认）：仅使用普通合成点击，不调用 chrome.debugger';
+    }
+  }
+
+  function setTrustedSendEnabled(enabled) {
+    allowTrustedSend = Boolean(enabled);
+    if (!allowTrustedSend) {
+      sendProfile.preferTrusted = false;
+      sendProfile.strikes = 0;
+    }
+    updatePanelMeta();
+    try {
+      if (chrome?.storage?.local) {
+        chrome.storage.local.set({ [TRUSTED_SEND_ENABLED_KEY]: allowTrustedSend });
+      }
+    } catch (_) {}
+  }
+
+  function saveSendProfile() {
+    sendProfile.sig = currentComposerSig() || sendProfile.sig;
+    updatePanelMeta();
+    try {
+      if (chrome?.storage?.local) {
+        chrome.storage.local.set({ [SEND_PROFILE_KEY]: { ...sendProfile, at: Date.now() } });
+      }
+    } catch (_) {}
+  }
+
+  function loadSendProfile() {
+    try {
+      if (!chrome?.storage?.local) return;
+      chrome.storage.local.get([SEND_PROFILE_KEY, TRUSTED_SEND_ENABLED_KEY], (res) => {
+        allowTrustedSend = Boolean(res && res[TRUSTED_SEND_ENABLED_KEY] === true);
+        const saved = res && res[SEND_PROFILE_KEY];
+        const sig = currentComposerSig();
+        if (allowTrustedSend && saved && sig && saved.sig === sig) {
+          sendProfile = {
+            preferTrusted: Boolean(saved.preferTrusted),
+            strikes: Number(saved.strikes) || 0,
+            sig,
+          };
+        } else {
+          sendProfile = { preferTrusted: false, strikes: 0, sig };
+        }
+        updatePanelMeta();
+      });
+      if (chrome.storage.onChanged) {
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area !== 'local' || !changes[TRUSTED_SEND_ENABLED_KEY]) return;
+          allowTrustedSend = changes[TRUSTED_SEND_ENABLED_KEY].newValue === true;
+          if (!allowTrustedSend) {
+            sendProfile.preferTrusted = false;
+            sendProfile.strikes = 0;
+          }
+          updatePanelMeta();
+        });
+      }
+    } catch (_) {}
+  }
+
+  // delivered=true 时记住哪种方式送达；可信连续两次失败则降级回合成探测。
+  function noteDelivery(delivered, attempt) {
+    if (!allowTrustedSend) return;
+    const before = `${sendProfile.preferTrusted}|${sendProfile.strikes}`;
+    if (delivered) {
+      sendProfile.strikes = 0;
+      if (attempt === 'trusted' && !sendProfile.preferTrusted) sendProfile.preferTrusted = true;
+    } else if (attempt === 'trusted') {
+      sendProfile.strikes += 1;
+      if (sendProfile.preferTrusted && sendProfile.strikes >= 2) {
+        sendProfile.preferTrusted = false;
+        sendProfile.strikes = 0;
+      }
+    }
+    if (`${sendProfile.preferTrusted}|${sendProfile.strikes}` !== before) saveSendProfile();
+  }
+
   async function sendTextToGeminiWeb(text, images = []) {
     const editor = findGeminiEditor();
     if (!editor) return false;
@@ -499,12 +678,8 @@
     const baselineQueries = countUserQueries();
     let attempts = 0;
     let clickRetries = 0;
+    let trustedTried = false;
     const humanJitterMs = 420 + Math.floor(Math.random() * 520);
-    const findEnabledSendBtn = () =>
-      document.querySelector('button.send-button:not([disabled])') ||
-      document.querySelector('button[aria-label*="Send"]:not([disabled])') ||
-      document.querySelector('button[aria-label*="发送"]:not([disabled])') ||
-      document.querySelector('.send-button-container button:not([disabled])');
     const verifyDelivered = () => {
       if (countUserQueries() > baselineQueries || isGeminiWebStreaming()) return;
       const curEditor = findGeminiEditor();
@@ -515,7 +690,15 @@
       curEditor.classList.remove('ql-blank');
       curEditor.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText' }));
       const btn = findEnabledSendBtn();
-      if (btn && btn.getAttribute('aria-disabled') !== 'true') {
+      if (allowTrustedSend && !trustedTried && clickRetries >= 1) {
+        trustedTried = true;
+        lastSendAttempt = 'trusted';
+        trustedSend(curEditor).catch((err) => {
+          console.warn('[AGWB] trusted send failed:', err);
+          statusEl.textContent = `⚠️ 可信发送失败: ${String((err && err.message) || err).slice(0, 60)}`;
+        });
+      } else if (btn && btn.getAttribute('aria-disabled') !== 'true') {
+        lastSendAttempt = 'synthetic';
         simulateClick(btn);
       } else if (clickRetries >= 2) {
         curEditor.dispatchEvent(
@@ -535,13 +718,34 @@
       attempts++;
       const sendBtn = findEnabledSendBtn();
       if (sendBtn && sendBtn.getAttribute('aria-disabled') !== 'true') {
+        lastSendAttempt = 'synthetic';
         simulateClick(sendBtn);
         setTimeout(verifyDelivered, 950);
       } else if (attempts < 18) {
         setTimeout(tryClickSend, 200 + Math.floor(Math.random() * 120));
       }
     };
-    setTimeout(tryClickSend, humanJitterMs);
+    // 仅在显式开启可信发送开关时，才在 1.6s 兜底触发一次 chrome.debugger 发送
+    if (allowTrustedSend) {
+      setTimeout(() => {
+        if (!allowTrustedSend || trustedTried) return;
+        if (countUserQueries() > baselineQueries || isGeminiWebStreaming()) return;
+        trustedTried = true;
+        lastSendAttempt = 'trusted';
+        trustedSend(editor).catch((err) => console.warn('[AGWB] trusted send failed:', err));
+      }, 1600);
+    }
+
+    if (allowTrustedSend && sendProfile.preferTrusted && sendProfile.sig === currentComposerSig()) {
+      trustedTried = true;
+      lastSendAttempt = 'trusted';
+      trustedSend(editor).catch((err) => {
+        console.warn('[AGWB] trusted send failed:', err);
+      });
+      setTimeout(verifyDelivered, 950);
+    } else {
+      setTimeout(tryClickSend, humanJitterMs);
+    }
     return true;
   }
 
@@ -810,12 +1014,18 @@
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
       <div style="font-weight:600;display:flex;align-items:center;gap:6px;">
         <span id="agwb-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#71717a;"></span>
-        <span>ZeroG Code Bridge v2.6.8</span>
+        <span id="agwb-ver">ZeroG Code Bridge</span>
+        <span id="agwb-sendmode" style="color:#f59e0b;font-size:11px;font-weight:500;"></span>
         <span id="agwb-webmodel" style="color:#38bdf8;font-size:11px;font-weight:500;"></span>
       </div>
-      <label style="cursor:pointer;display:flex;align-items:center;gap:4px;color:#a1a1aa;" title="仅纯网页对话时勾选；使用 VS Code 插件时保持关闭">
-        <input type="checkbox" id="agwb-auto" style="margin:0;"> 网页自闭环
-      </label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <label style="cursor:pointer;display:flex;align-items:center;gap:3px;color:#f59e0b;" title="默认关闭以降低风控暴露；仅当新版 Gemini 忽略普通点击无法发送时勾选（发送瞬间会短暂调用 chrome.debugger）">
+          <input type="checkbox" id="agwb-trusted" style="margin:0;"> 可信发送
+        </label>
+        <label style="cursor:pointer;display:flex;align-items:center;gap:3px;color:#a1a1aa;" title="仅纯网页对话时勾选；使用 VS Code 插件时保持关闭">
+          <input type="checkbox" id="agwb-auto" style="margin:0;"> 自闭环
+        </label>
+      </div>
     </div>
     <div id="agwb-status" style="color:#a1a1aa;background:#27272a;padding:5px 8px;border-radius:6px;margin-bottom:8px;min-height:18px;word-break:break-all;max-height:72px;overflow:auto;">
       正在连接本地 Bridge (127.0.0.1:18765)...
@@ -830,15 +1040,22 @@
       <button id="agwb-btn-stop" style="flex:1;cursor:pointer;padding:4px 6px;border-radius:5px;border:1px solid #7f1d1d;background:#450a0a;color:#fca5a5;font-size:11px;">⏹️ 停止执行</button>
     </div>
   `;
+
   document.body.appendChild(box);
+  updatePanelMeta();
+  loadSendProfile();
 
   const dotEl = box.querySelector('#agwb-dot');
   const webModelEl = box.querySelector('#agwb-webmodel');
   const statusEl = box.querySelector('#agwb-status');
   const autoChk = box.querySelector('#agwb-auto');
+  const trustedChk = box.querySelector('#agwb-trusted');
   const engineBtn = box.querySelector('#agwb-btn-engine');
 
   autoChk.onchange = () => { autoLoop = autoChk.checked; };
+  if (trustedChk) {
+    trustedChk.onchange = () => { setTrustedSendEnabled(trustedChk.checked); };
+  }
   engineBtn.onclick = () => {
     localEngine = localEngine === 'local-tool' ? 'agy' : 'local-tool';
     engineBtn.textContent = localEngine === 'local-tool' ? '⚡ 0额度纯工具' : '🤖 本地AGY';
@@ -993,6 +1210,7 @@
     // 用户消息已出现在对话里 = 已发出；立即通知服务端释放「串行发送锁」，允许其它对话栏开始发送
     if (!st.sent && (countUserQueries() > st.baselineUserCount || nodes.length > st.baselineCount)) {
       st.sent = true;
+      noteDelivery(true, lastSendAttempt);
       bridgeRequest('POST', '/browser/report', {
         requestId: st.reqId,
         step: st.step,
@@ -1016,6 +1234,7 @@
         completedReqIds.add(st.cmdKey);
         activeWatchState = null;
         statusEl.textContent = '❌ 消息未能发出，正在交由本地服务重试';
+        noteDelivery(false, lastSendAttempt);
         const limitNotice = detectUsageLimitNotice(null);
         const pageErr = detectPageErrorNotice();
         reportWithRetry({

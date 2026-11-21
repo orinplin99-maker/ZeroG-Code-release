@@ -1,4 +1,4 @@
-// Background Service Worker (v2.6.8):
+// Background Service Worker (v2.7.0):
 // 1. 严格隔离用户手动窗口 + 零残留受管窗口：绝不征用/跳转/关闭用户手动打开的 Gemini 页签，仅复用真实空闲的插件受管页签
 // 2. 串行路由 + 实时探活：单飞指令队列防并发抢占，派发前实时探测 streaming/thinking/pendingReply/hasConversation，后台 WEB_TICK 驱动不抢焦点
 // 3. 单会话精准中断：停止指令严格按 sessionId / webChatUrl 路由到对应标签页，绝不连带中断其它会话
@@ -973,6 +973,55 @@ chrome.runtime.onStartup.addListener(() => {
   ensureKeepaliveAlarm();
 });
 
+
+// 新版 Gemini 页面忽略 isTrusted=false 的点击/回车，只有浏览器级输入才生效。
+// 这里用 chrome.debugger 临时挂载标签页发一次真实鼠标/键盘事件，发完立刻 detach。
+function withAttachedDebugger(tabId, fn) {
+  return new Promise((resolve) => {
+    const target = { tabId };
+    const detach = () => {
+      try {
+        chrome.debugger.detach(target, () => void chrome.runtime.lastError);
+      } catch (_) {}
+    };
+    try {
+      chrome.debugger.attach(target, '1.3', async () => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        try {
+          await fn(target);
+          resolve({ ok: true });
+        } catch (err) {
+          resolve({ ok: false, error: String((err && err.message) || err) });
+        } finally {
+          detach();
+        }
+      });
+    } catch (err) {
+      resolve({ ok: false, error: String((err && err.message) || err) });
+    }
+  });
+}
+
+async function trustedPointerClick(tabId, x, y) {
+  return withAttachedDebugger(tabId, async (target) => {
+    const base = { x, y, button: 'left', clickCount: 1 };
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' });
+  });
+}
+
+async function trustedEnter(tabId) {
+  return withAttachedDebugger(tabId, async (target) => {
+    const key = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
+    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyDown', ...key });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', ...key });
+  });
+}
+
 ensureLocalhostBypassedInProxy();
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -997,6 +1046,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     sendResponse({ ok: true });
     return false;
+  }
+
+  if (msg.type === 'TRUSTED_INPUT') {
+    const tabId = sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'no tabId' });
+      return false;
+    }
+    chrome.storage.local.get(['agwb_allow_trusted_send'], (cfg) => {
+      if (!cfg || cfg.agwb_allow_trusted_send !== true) {
+        sendResponse({ ok: false, error: 'trusted input disabled by user setting' });
+        return;
+      }
+      const action = msg.kind === 'enter'
+        ? trustedEnter(tabId)
+        : trustedPointerClick(tabId, Number(msg.x), Number(msg.y));
+      action
+        .then((res) => sendResponse(res))
+        .catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
+    });
+    return true;
   }
 
   if (msg.type !== 'BRIDGE_REQUEST') return false;

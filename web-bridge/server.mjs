@@ -14,6 +14,93 @@ import { spawn, execFile } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import {
+  normalizeUiMode,
+  getModePolicy,
+  isReadOnlyMode,
+  evaluateToolPermission,
+  buildModeChangeNotice,
+} from './harness/modes.mjs';
+import {
+  buildContextHintsBlock,
+  rankContextEntriesByQuery,
+} from './harness/contextRouter.mjs';
+
+import {
+  appendSessionEvent,
+  createLoopGuardState,
+  enqueueSteer,
+  drainSteerBlock,
+  evaluateBatchLoopGuard,
+} from './harness/loopGuard.mjs';
+import {
+  loadTaskState,
+  applyUpdatePlan,
+  recordTouchedFile,
+  bumpContextBudget,
+  shouldProactiveRollover,
+  formatTaskStateForHandoff,
+  toClientPlanEntries,
+} from './harness/taskState.mjs';
+import {
+  resolveSubagentRolePreset,
+  buildRoleSubagentProtocol,
+} from './harness/subagentRoles.mjs';
+
+const SERVER_STARTED_AT = Date.now();
+
+const sessionLastUiMode = new Map();
+const pendingApprovalResolvers = new Map();
+
+function requiresAskModeApproval(toolName, args = {}, execContext = {}) {
+  if (execContext.isSubagent || !execContext.parentTask) return false;
+  const mode = normalizeUiMode(execContext.parentTask.uiMode || execContext.uiMode);
+  if (mode !== 'default') return false;
+  if (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'mcp_call') return true;
+  if (toolName === 'run_command') {
+    const cmd = String(args.command || args.CommandLine || '').trim();
+    return !/^(git\s+(status|log|diff|branch|show)|ls|dir|pwd|cat|type|head|tail|Get-ChildItem|Get-Content|Select-String|Test-Path|node\s+--check)\b/i.test(cmd);
+  }
+  return false;
+}
+
+function requestWebTaskApproval(task, { toolName, title, args }, isCancelled) {
+  const approvalId = `appr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const approvalPayload = {
+    approvalId,
+    requestId: task.requestId,
+    toolName,
+    title: String(title || toolName).slice(0, 120),
+    args: args || {},
+    createdAt: Date.now(),
+  };
+  task.pendingApproval = approvalPayload;
+  task.updatedAt = Date.now();
+  appendSessionEvent(task.sessionId, 'approval_requested', {
+    requestId: task.requestId,
+    approvalId,
+    toolName,
+    title: approvalPayload.title,
+  });
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (decisionObj) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(watchTimer);
+      pendingApprovalResolvers.delete(approvalId);
+      if (task.pendingApproval?.approvalId === approvalId) task.pendingApproval = null;
+      task.updatedAt = Date.now();
+      resolve(decisionObj);
+    };
+    const watchTimer = setInterval(() => {
+      if ((isCancelled && isCancelled()) || task.status === 'cancelled') {
+        finish({ decision: 'cancelled' });
+      }
+    }, 250);
+    pendingApprovalResolvers.set(approvalId, { task, finish });
+  });
+}
 
 const require = createRequire(import.meta.url);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +118,19 @@ try {
 
 const PORT = Number(process.env.WEB_BRIDGE_PORT || bridgeConfig.port || 18765);
 const DEFAULT_CWD = process.env.WEB_BRIDGE_CWD || bridgeConfig.cwd || process.cwd();
+
+// 本机接口访问控制：放行本机原生客户端（无 Origin）与浏览器扩展，其余来源默认拒绝。
+// 否则任意网页都能 POST /ask 让本机执行 run_command；gemini.google.com 是扩展注入页
+// 直连 Bridge 的既有通道（content.js 的兜底 fetch），只放行这一个站点。
+const PAGE_ORIGINS = new Set(
+  [
+    'https://gemini.google.com',
+    ...(Array.isArray(bridgeConfig.allowedOrigins) ? bridgeConfig.allowedOrigins : []),
+    ...String(process.env.WEB_BRIDGE_ALLOWED_ORIGINS || '').split(','),
+  ]
+    .map((s) => String(s || '').trim())
+    .filter(Boolean)
+);
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}\n`;
@@ -250,20 +350,43 @@ const PWSH_EXE = IS_WIN && fs.existsSync('C:\\Program Files\\PowerShell\\7\\pwsh
   ? 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
   : 'pwsh';
 
+function decodeShellOutput(raw) {
+  if (raw == null) return '';
+  if (typeof raw === 'string') return raw;
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+  if (!buf.length) return '';
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    try {
+      return new TextDecoder('gb18030').decode(buf);
+    } catch {
+      return buf.toString('utf8');
+    }
+  }
+}
+
 function runShell(command, opts) {
   const cmdStr = String(command || '');
   if (IS_WIN) {
-    const psScript =
-      `$OutputEncoding = [Text.UTF8Encoding]::new($false); ` +
-      `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ` +
-      cmdStr;
+    const psScript = [
+      '$OutputEncoding = [Text.UTF8Encoding]::new($false)',
+      '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)',
+      cmdStr,
+    ].join('\n');
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
     const runWith = (exe) =>
       new Promise((resolve) => {
         execFile(
           exe,
-          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript],
-          { encoding: 'utf8', windowsHide: true, maxBuffer: 4 * 1024 * 1024, ...opts },
-          (err, stdout, stderr) => resolve({ err, stdout: String(stdout || ''), stderr: String(stderr || '') })
+          ['-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+          { windowsHide: true, maxBuffer: 4 * 1024 * 1024, ...opts, encoding: 'buffer' },
+          (err, stdout, stderr) =>
+            resolve({
+              err,
+              stdout: decodeShellOutput(stdout),
+              stderr: decodeShellOutput(stderr),
+            })
         );
       });
     return runWith(PWSH_EXE).then((r) => (r.err?.code === 'ENOENT' ? runWith('powershell.exe') : r));
@@ -579,22 +702,49 @@ class LocalToolExecutor {
     const targetPath = rawPath ? resolveSafePath(rawPath, workCwd) : '';
 
     try {
-      if (execContext.isSubagent && toolName === 'web_subagent') {
+      const perm = evaluateToolPermission(toolName, args, execContext);
+      if (!perm.allowed) {
+        if (execContext.parentTask?.sessionId) {
+          appendSessionEvent(execContext.parentTask.sessionId, 'tool_blocked', {
+            tool: toolName,
+            code: perm.code,
+            uiMode: execContext.uiMode || execContext.parentTask.uiMode,
+          });
+        }
         return {
           ok: false,
           tool: toolName,
-          title: 'web_subagent',
-          output: '子代理不允许递归调用 web_subagent，请直接用本地只读工具完成调研并汇总结果。',
+          title:
+            rawPath ||
+            (toolName === 'run_command' ? String(args.command || args.CommandLine || '').slice(0, 60) : toolName),
+          output: perm.reason || `当前模式禁止调用 ${toolName}`,
         };
       }
 
-      if (execContext.readOnly && (toolName === 'edit_file' || toolName === 'write_file')) {
-        return {
-          ok: false,
-          tool: toolName,
-          title: rawPath || toolName,
-          output: `当前只读子代理禁止调用 ${toolName}，请仅做只读检索分析并把修改建议返回给主对话。`,
-        };
+      if (requiresAskModeApproval(toolName, args, execContext)) {
+        const approvalTitle = summarizeInitialToolTitle(toolName, args);
+        const decisionRes = await requestWebTaskApproval(
+          execContext.parentTask,
+          { toolName, title: approvalTitle, args },
+          execContext.isCancelled
+        );
+        if (decisionRes.decision === 'cancelled') {
+          return {
+            ok: false,
+            cancelled: true,
+            tool: toolName,
+            title: approvalTitle,
+            output: '任务已取消',
+          };
+        }
+        if (decisionRes.decision !== 'allow') {
+          return {
+            ok: false,
+            tool: toolName,
+            title: approvalTitle,
+            output: `用户已拒绝在 Ask 模式下执行 ${toolName} (${approvalTitle})。请不要强行重试相同写入操作，先调整方案或向用户确认下一步。`,
+          };
+        }
       }
 
       if (toolName === 'read_file') {
@@ -702,16 +852,30 @@ class LocalToolExecutor {
         if (!target) {
           return { ok: false, tool: toolName, title: path.basename(targetPath), output: 'edit_file 缺少 target 参数' };
         }
-        if (!before.includes(target)) {
-          return {
-            ok: false,
-            tool: toolName,
-            title: path.basename(targetPath),
-            output: `edit_file 失败：在 ${targetPath} 中未找到完全匹配的 target 片段，请先用 read_file 确认原文`,
-          };
+        let actualTarget = target;
+        let actualReplacement = replacement;
+        if (!before.includes(actualTarget)) {
+          const eol = before.includes('\r\n') ? '\r\n' : '\n';
+          const normalizedTarget = target.replace(/\r\n|\r|\n/g, eol);
+          if (normalizedTarget !== target && before.includes(normalizedTarget)) {
+            actualTarget = normalizedTarget;
+            actualReplacement = replacement.replace(/\r\n|\r|\n/g, eol);
+          } else {
+            return {
+              ok: false,
+              tool: toolName,
+              title: path.basename(targetPath),
+              output: `edit_file 失败：在 ${targetPath} 中未找到完全匹配的 target 片段，请先用 read_file 确认原文`,
+            };
+          }
         }
-        const after = before.split(target).join(replacement);
+        const after = before.split(actualTarget).join(actualReplacement);
         fs.writeFileSync(targetPath, after, 'utf8');
+        if (execContext.parentTask?.sessionId && !execContext.isSubagent) {
+          try {
+            recordTouchedFile(execContext.parentTask.sessionId, toDisplayPath(targetPath), execContext.uiMode);
+          } catch (_) {}
+        }
         return {
           ok: true,
           tool: toolName,
@@ -728,12 +892,40 @@ class LocalToolExecutor {
         fs.mkdirSync(path.dirname(targetPath), { recursive: true });
         const content = String(args.content ?? args.Content ?? '');
         fs.writeFileSync(targetPath, content, 'utf8');
+        if (execContext.parentTask?.sessionId && !execContext.isSubagent) {
+          try {
+            recordTouchedFile(execContext.parentTask.sessionId, toDisplayPath(targetPath), execContext.uiMode);
+          } catch (_) {}
+        }
         return {
           ok: true,
           tool: toolName,
           title: path.basename(targetPath),
           args: { Path: targetPath, Content: content },
           output: `已成功写入文件: ${targetPath} (${content.length} 字符)`,
+        };
+      }
+
+      if (toolName === 'update_plan') {
+        const sid = execContext.parentTask?.sessionId || execContext.sessionId || 'default';
+        const planArg = Array.isArray(args.plan) ? args.plan : (Array.isArray(args.steps) ? args.steps : undefined);
+        const st = applyUpdatePlan(sid, { ...args, plan: planArg }, execContext.uiMode);
+        const entries = toClientPlanEntries(st);
+        if (execContext.parentTask) {
+          execContext.parentTask.planEntries = entries;
+          execContext.parentTask.updatedAt = Date.now();
+        }
+        appendSessionEvent(sid, 'plan_updated', {
+          requestId: execContext.parentTask?.requestId || '',
+          stepCount: entries.length,
+          completedCount: entries.filter((e) => e.status === 'completed').length,
+        });
+        return {
+          ok: true,
+          tool: toolName,
+          title: `更新任务进度 (${entries.length} 步)`,
+          args: { goal: st.goal, plan: st.plan },
+          output: `已更新本地任务状态机（共 ${entries.length} 步，已完成 ${entries.filter((e) => e.status === 'completed').length} 步）。`,
         };
       }
 
@@ -746,11 +938,17 @@ class LocalToolExecutor {
         // 默认 180s，最长 600s（编译 / 脚本 / 慢命令）；工具在后台跑，不阻塞 Bridge
         const timeoutMs = Math.min(600000, Math.max(3000, Number(args.timeoutMs || 180000)));
         const r = await runShell(command, { cwd: cmdCwd, timeout: timeoutMs });
+        const stdoutText = String(r.stdout || '').trim();
+        const stderrText = String(r.stderr || '').trim();
+        const errHead = r.err
+          ? `[Exit Code ${r.err.code ?? r.err.signal ?? 'ERR'}]${r.err.killed ? ' (killed/timeout)' : ''}`
+          : '';
+        const errDetail = r.err && !stdoutText && !stderrText ? ` ${r.err.message}` : '';
         const out = r.err
-          ? `[Exit Code ${r.err.code ?? 'ERR'}] ${r.err.message}\n${r.stdout}\n${r.stderr}`
-          : r.stdout;
+          ? [errHead + errDetail, stdoutText, stderrText].filter(Boolean).join('\n')
+          : [r.stdout, r.stderr].filter((s) => String(s || '').trim()).join('\n');
         return {
-          ok: true,
+          ok: !r.err,
           tool: toolName,
           title: command.slice(0, 60),
           args: { CommandLine: command, Cwd: cmdCwd },
@@ -771,7 +969,7 @@ class LocalToolExecutor {
           tool: toolName,
           title: pat,
           args: { Pattern: pat, Path: searchDir },
-          output: `按文件名搜索 "${pat}" (${searchDir})，命中 ${rels.length} 个:\n${rels.join('\n') || '无匹配文件'}`,
+          output: `按路径模式搜索 "${pat}" (${searchDir})，命中 ${rels.length} 个:\n${rels.join('\n') || '无匹配文件'}`,
         };
       }
 
@@ -998,6 +1196,7 @@ class LocalToolExecutor {
         statusTag: res.ok ? 'ok' : 'error',
         output: String(res.output || ''),
         readMeta: res.readMeta || null,
+        rawResult: res,
       };
     };
 
@@ -1026,6 +1225,11 @@ class LocalToolExecutor {
       }
     }
 
+    if (typeof execContext.onBatchResults === 'function') {
+      try {
+        execContext.onBatchResults(orderedEntries.filter(Boolean).map((e) => e.rawResult).filter(Boolean));
+      } catch {}
+    }
     return LocalToolExecutor.assembleBatchResults(orderedEntries);
   }
 }
@@ -1223,7 +1427,7 @@ function matchesQuery(text, query) {
   return q.split(/\s+/).filter(Boolean).every((tok) => hay.includes(tok));
 }
 
-function collectRulesSummary(workCwd, opts = {}, query = '') {
+function listRuleEntries(workCwd, opts = {}) {
   const globalRulesDir = opts.rulesDir ? resolveSafePath(opts.rulesDir, workCwd) : DEFAULT_RULES_DIR;
   const searchDirs = [];
   const seenDir = new Set();
@@ -1282,7 +1486,15 @@ function collectRulesSummary(workCwd, opts = {}, query = '') {
     }
   }
 
-  const filtered = items.filter((it) => matchesQuery(`${it.path} ${it.title} ${it.description}`, query));
+  return { globalRulesDir, items };
+}
+
+function collectRulesSummary(workCwd, opts = {}, query = '') {
+  const { globalRulesDir, items } = listRuleEntries(workCwd, opts);
+  const filtered = rankContextEntriesByQuery(
+    items.filter((it) => matchesQuery(`${it.path} ${it.title} ${it.description}`, query)),
+    query
+  );
   if (!filtered.length) {
     return [
       '### 规则索引 (rules)',
@@ -1306,50 +1518,66 @@ function collectRulesSummary(workCwd, opts = {}, query = '') {
   return lines.join('\n');
 }
 
-function collectMemorySummary(workCwd, opts = {}, query = '') {
+function listMemoryEntries(workCwd, opts = {}) {
   const { primaryWriteDir, readDirs } = resolveMemoryDirs(workCwd, opts.memoryDir);
-  const lines = [
-    '### 记忆索引 (memory)',
-    `- 独立写入目录（新增/更新长期记忆请使用 write_file/edit_file 写入此处）: \`${toDisplayPath(primaryWriteDir)}\``,
-  ];
-
-  let totalFiles = 0;
-  const matchedEntries = [];
-
+  const entries = [];
+  const indexFiles = [];
   for (const dir of readDirs) {
     if (!fs.existsSync(dir)) continue;
     const isPrimary = path.resolve(dir).toLowerCase() === path.resolve(primaryWriteDir).toLowerCase();
     const files = listMarkdownFilesShallow(dir, 2);
     if (!files.length) continue;
-
-    // 优先展示 MEMORY.md 索引摘要
     const indexFile = files.find((f) => path.basename(f).toLowerCase() === 'memory.md');
+    if (indexFile) indexFiles.push(indexFile);
     for (const f of files) {
-      totalFiles += 1;
       const rel = toContextPath(f, workCwd);
       const meta = extractMarkdownFrontmatterMeta(f, path.basename(f));
-      const tag = isPrimary ? '主写' : '兼容只读';
-      if (matchesQuery(`${rel} ${meta.title} ${meta.description}`, query)) {
-        matchedEntries.push(`- [${tag}] \`${rel}\`${meta.description || meta.title ? ` — ${meta.description || meta.title}` : ''}`);
-      }
+      entries.push({
+        path: rel,
+        title: meta.title || path.basename(f),
+        description: meta.description || meta.title || '',
+        isPrimary,
+        isIndex: path.basename(f).toLowerCase() === 'memory.md',
+      });
     }
+  }
+  return { primaryWriteDir, entries, indexFiles };
+}
 
-    if (indexFile && !query) {
+function collectMemorySummary(workCwd, opts = {}, query = '') {
+  const { primaryWriteDir, entries, indexFiles } = listMemoryEntries(workCwd, opts);
+  const lines = [
+    '### 记忆索引 (memory)',
+    `- 独立写入目录（新增/更新长期记忆请使用 write_file/edit_file 写入此处）: \`${toDisplayPath(primaryWriteDir)}\``,
+  ];
+
+  const totalFiles = entries.length;
+  const matched = rankContextEntriesByQuery(
+    entries.filter((e) => matchesQuery(`${e.path} ${e.title} ${e.description}`, query)),
+    query
+  );
+
+  if (!query) {
+    for (const indexFile of indexFiles) {
       try {
         const raw = normalizeHomePathsInText(fs.readFileSync(indexFile, 'utf8').trim());
         if (raw) {
-          const preview = raw.length > 1600 ? raw.slice(0, 1600) + '\n...(索引已截断，完整内容请 read_file 读取)' : raw;
+          const preview = raw.length > 1400 ? raw.slice(0, 1400) + '\n...(索引已截断，完整内容请 read_file 读取)' : raw;
           lines.push(`\n#### 索引摘要 \`${toContextPath(indexFile, workCwd)}\`\n${preview}`);
         }
       } catch {}
     }
   }
 
-  if (matchedEntries.length) {
-    lines.push(`\n#### 可读取的记忆文件 (${matchedEntries.length}${query ? ` / ${totalFiles}` : ''})`);
-    lines.push(...matchedEntries.slice(0, 60));
-    if (matchedEntries.length > 60) {
-      lines.push(`...(其余 ${matchedEntries.length - 60} 条已省略，可传 query 筛选)`);
+  if (matched.length) {
+    const cap = query ? 40 : 35;
+    lines.push(`\n#### 可读取的记忆文件 (${matched.length}${query ? ` / ${totalFiles}` : ''})`);
+    for (const e of matched.slice(0, cap)) {
+      const tag = e.isPrimary ? '主写' : '兼容只读';
+      lines.push(`- [${tag}] \`${e.path}\`${e.description ? ` — ${e.description}` : ''}`);
+    }
+    if (matched.length > cap) {
+      lines.push(`...(其余 ${matched.length - cap} 条已省略，建议传 query 关键词精准筛选)`);
     }
   } else {
     lines.push(
@@ -1467,67 +1695,65 @@ function buildSystemToolProtocol(cwd, opts = {}) {
   const workCwd = cwd || state.cwd || DEFAULT_CWD;
   const displayCwd = toDisplayPath(workCwd);
   const shellHint = IS_WIN ? 'PowerShell命令' : 'Shell命令';
+  const uiMode = normalizeUiMode(opts?.uiMode);
+  const modePolicy = getModePolicy(uiMode);
   const researchHint = opts?.researchHint ? String(opts.researchHint).trim() : '';
+  const contextHints = opts?.contextHints ? String(opts.contextHints).trim() : '';
+
+  const actionPhrase = modePolicy.readOnly
+    ? '从工作区摘取文件片段、搜索符号或查阅规范'
+    : '从工作区摘取文件片段、搜索符号、查阅规范或应用代码改动';
 
   const lines = [
     '### 工作区资料协作说明',
-    `你只需输出纯文本分析。当需要我帮你从工作区摘取文件片段、搜索符号、查阅规范或应用代码改动时，可在回复末尾附一段 \`json:local-tool\` 清单，我会在下条消息把对应资料贴给你。工作区目录: \`${displayCwd}\``,
+    `你只需输出纯文本分析。当需要我帮你${actionPhrase}时，可在回复末尾附一段 \`json:local-tool\` 数组清单，我会在下条消息把结果贴给你。工作区: \`${displayCwd}\``,
+    modePolicy.protocolRule,
     '```json:local-tool',
     '[',
-    '  {"tool": "get_context", "args": {"kind": "rules"}},',
-    '  {"tool": "get_context", "args": {"kind": "memory"}}',
+    '  {"tool": "search_code", "args": {"pattern": "symbol", "path": "src"}},',
+    '  {"tool": "read_file", "args": {"path": "src/file.ts", "startLine": 1, "endLine": 120}}',
     ']',
     '```',
-    '可请求的资料项（连续只读项会自动并行，路径支持相对路径、`~/` 或绝对路径）：',
-    '- `get_context`: `{"kind": "rules|memory|skills|index|all", "query": "可选筛选词"}`（首轮未附带规范/记忆/技能/索引，按需先查）',
+    '可用工具（连续只读项自动并行，路径支持相对路径、`~/` 或绝对路径）：',
+    '- `get_context`: `{"kind": "rules|memory|skills|index|all", "query": "建议传关键词筛选"}`（按需查询）',
     '- `read_file`: `{"path": "...", "startLine": 1, "endLine": 250}` | `list_dir`: `{"path": "..."}` | `find_files`: `{"pattern": "*Cfg*", "path": "..."}`',
     '- `search_code`: `{"pattern": "关键词或正则", "path": "可选目录", "glob": "*.ts", "maxCount": 80}`',
-    '- `edit_file`: `{"path": "...", "target": "原文本", "replacement": "新文本"}` | `write_file`: `{"path": "...", "content": "全文"}`',
-    `- \`run_command\`: \`{"command": "${shellHint}", "cwd": "可选目录", "timeoutMs": 180000}\``,
-    '- `mcp_list`: `{"server": "可选服务名"}` | `mcp_call`: `{"server": "服务名", "mcpTool": "工具名", "args": {...}}`',
-    `- \`web_subagent\`: \`{"role": "子任务角色", "task": "具体符号/问题与返回要求", "readOnly": true, "maxSteps": 4}\`（**并行调研提速**：后台轻页签并行跑完多步检索并立即自动关闭页签，不占主上下文；单批最多派 **${MAX_CONCURRENT_SUBAGENTS}** 个以免多开网页卡顿）`,
-    '协作习惯：',
-    '1) **先查后答**：涉及代码/规范先查阅再作答，附清单后立即结束本条回复。',
-    `2) **直查 vs 子代理分流**：已知精确落点且 1~2 批小查询可搞定 → 直接 \`search_code\`/\`read_file\`；**跨模块/跨层排查**（如 Lua+C++、多目录调用链）或**未知落点预计需 ≥3 轮检索** → 优先同批并行派发最多 ${MAX_CONCURRENT_SUBAGENTS} 个 \`web_subagent\`（可与 \`get_context\` 同批发出），并在 \`task\` 中要求先 \`search_code\` 定位再精读、返回“结论 + path:line + 关键分支”。`,
-    '3) **结论先行**：路径统一用反引号 `` `src/file:line` ``（正斜杠）。',
   ];
+
+  if (!modePolicy.readOnly) {
+    lines.push(
+      '- `edit_file`: `{"path": "...", "target": "原文本", "replacement": "新文本"}` | `write_file`: `{"path": "...", "content": "全文"}`',
+      `- \`run_command\`: \`{"command": "${shellHint}", "cwd": "可选目录", "timeoutMs": 180000}\``
+    );
+  } else {
+    lines.push(
+      `- \`run_command\`: \`{"command": "仅限只读检查命令(${shellHint})", "cwd": "可选目录"}\`（Plan 模式已硬禁止 \`edit_file\`/\`write_file\` 与写命令）`
+    );
+  }
+
+  lines.push(
+    '- `mcp_list`: `{"server": "可选服务名"}` | `mcp_call`: `{"server": "服务名", "mcpTool": "工具名", "args": {...}}`',
+    `- \`web_subagent\`: \`{"role": "researcher|reviewer|planner", "task": "目标与返回要求", "readOnly": true, "maxSteps": 4}\`（角色化独立子代理，跨模块/审查/规划可并行派最多 **${MAX_CONCURRENT_SUBAGENTS}** 个）`,
+    '约定：先查证再作答，附清单后即结束本条回复；路径统一用反引号 `` `src/file:line` ``（正斜杠）。'
+  );
+
+  if (contextHints) lines.push(contextHints);
   if (researchHint) lines.push(researchHint);
   lines.push('---');
   return lines.join('\n');
 }
 
-function buildSubagentProtocol({ cwd, role, readOnly = true, maxSteps = 4 }) {
+function buildSubagentProtocol({ cwd, role, readOnly = true, maxSteps }) {
   const workCwd = cwd || state.cwd || DEFAULT_CWD;
   const displayCwd = toDisplayPath(workCwd);
   const shellHint = IS_WIN ? 'PowerShell命令' : 'Shell命令 (bash/zsh)';
-
-  return [
-    `### 本地调研子任务约定（角色：${role || 'Subagent'}）`,
-    `你只需输出纯文本，独立完成下方子任务并整理精炼、有代码证据支撑的结构化结论。当前工作目录: \`${displayCwd}\`。`,
-    '需要查询本机文件、规范或 MCP 时，在回复末尾附上 `json:local-tool` 代码块（同批连续只读请求会并发执行，本机会把输出贴回下一条消息）：',
-    '```json:local-tool',
-    '[',
-    '  {"tool": "search_code", "args": {"pattern": "functionName", "path": "src"}},',
-    '  {"tool": "read_file", "args": {"path": "src/index.ts", "startLine": 1, "endLine": 120}}',
-    ']',
-    '```',
-    '可用请求类型：',
-    '- `get_context`: `{"kind": "rules|memory|skills|index|all", "query": "可选筛选词"}`',
-    '- `read_file`: `{"path": "...", "startLine": 1, "endLine": 400}`',
-    '- `find_files`: `{"pattern": "*Config*", "path": "可选目录"}` | `list_dir`: `{"path": "目录"}`',
-    '- `search_code`: `{"pattern": "关键词或正则", "path": "可选目录", "glob": "*.ts", "maxCount": 80}`',
-    `- \`run_command\`: \`{"command": "${shellHint}", "cwd": "可选目录", "timeoutMs": 180000}\`（${readOnly ? '仅限只读查询' : '按需执行验证命令'}）`,
-    '- `mcp_list`: `{"server": "可选服务名"}` | `mcp_call`: `{"server": "服务名", "mcpTool": "工具名", "args": {...}}`',
-    readOnly
-      ? '- 当前为只读子任务，禁止写入或修改文件（`edit_file`/`write_file` 已禁用）。'
-      : '- `edit_file`: `{"path": "...", "target": "精确原文本", "replacement": "新文本"}` | `write_file`: `{"path": "...", "content": "完整内容"}`',
-    '高效检索纪律（务必遵守以缩短耗时）：',
-    `1. 最多执行 ${maxSteps} 批请求（不可递归调用 \`web_subagent\`）；每批合并 2~4 个只读查询并发执行，力争 2~3 批收口。`,
-    '2. **禁止从第 1 行顺序通读大文件**：先用 `search_code` 搜目标符号拿到精确行号，再按命中区间直接 `read_file` 精读，跳过无关构造函数与初始化代码。',
-    '3. **截断必补读**：若核心函数处被截断且仍有剩余批次，必须立即补读该行段，禁止留一句“实现在后半段未读”就交卷。',
-    '4. 输出 `json:local-tool` 后立即结束本次回复；最终结论控制在 600 字内，结论先行，只列核心分支与反引号路径 `` `src/index.ts:42` ``（统一正斜杠）。',
-    '---',
-  ].join('\n');
+  return buildRoleSubagentProtocol({
+    displayCwd,
+    rawRole: role,
+    readOnly,
+    maxSteps,
+    shellHint,
+  }).protocolText;
 }
 
 const VALID_LOCAL_TOOLS = [
@@ -1541,6 +1767,7 @@ const VALID_LOCAL_TOOLS = [
   'run_command',
   'mcp_list',
   'mcp_call',
+  'update_plan',
   'web_subagent',
 ];
 
@@ -1566,10 +1793,14 @@ function parseToolCallsFromMarkdown(rawMarkdown) {
   // 回复在代码块未闭合时被截取（或模型漏写结尾围栏）：补一个结尾围栏，避免整批工具调用被忽略
   let markdownText = String(rawMarkdown).replace(/\r\n/g, '\n');
   if ((markdownText.match(/```/g) || []).length % 2 === 1) markdownText += '\n```';
-  // 匹配所有代码块，取最后一个包含工具调用的块
+  // 匹配所有代码块：显式标注的 local-tool/local-agent JSON 块按出现顺序合并，避免前序块被覆盖丢弃
   const fenceRegex = /```([^\r\n]*)\r?\n([\s\S]*?)```/g;
+  const isValidToolSpecs = (arr) =>
+    arr.length > 0 && arr.every((x) => x && VALID_LOCAL_TOOLS.includes(x.tool || x.name));
   let match;
-  let lastParsed = null;
+  const explicitSpecs = [];
+  let lastNaturalTask = null;
+  let fallbackJsonSpecs = null;
 
   while ((match = fenceRegex.exec(markdownText)) !== null) {
     const info = (match[1] || '').trim().toLowerCase();
@@ -1582,8 +1813,8 @@ function parseToolCallsFromMarkdown(rawMarkdown) {
       const parsed = tryParseJsonLenient(cleaned);
       if (parsed) {
         const arr = Array.isArray(parsed) ? parsed : [parsed];
-        if (arr.length > 0 && arr.every((x) => x && VALID_LOCAL_TOOLS.includes(x.tool || x.name))) {
-          lastParsed = { kind: 'json-tools', specs: arr };
+        if (isValidToolSpecs(arr)) {
+          explicitSpecs.push(...arr);
           continue;
         }
       }
@@ -1597,30 +1828,36 @@ function parseToolCallsFromMarkdown(rawMarkdown) {
       if (!rest) continue;
       const parsed = tryParseJsonLenient(rest);
       if (parsed) {
-        lastParsed = { kind: 'json-tools', specs: Array.isArray(parsed) ? parsed : [parsed] };
+        const arr = Array.isArray(parsed) ? parsed : [parsed];
+        if (isValidToolSpecs(arr)) {
+          explicitSpecs.push(...arr);
+        }
       } else {
-        lastParsed = { kind: 'natural-task', task: rest };
+        lastNaturalTask = { kind: 'natural-task', task: rest };
       }
       continue;
     }
 
-    // 3. 未标注 local-tool 的普通 JSON 代码块，仅当位于回复末尾（后续非空文本 <= 80 字符）时才兜底触发，
+    // 3. 未标注 local-tool 的普通 JSON 代码块，仅当无显式工具块且位于回复末尾（后续非空文本 <= 80 字符）时才兜底触发，
     // 避免正文中间用于说明协议/示范的示例 JSON 被误当成真实工具调用执行
     const afterBlockText = markdownText.slice(match.index + match[0].length).trim();
     if (
+      explicitSpecs.length === 0 &&
       afterBlockText.length <= 80 &&
       ((body.startsWith('[') && body.endsWith(']')) || (body.startsWith('{') && body.endsWith('}')))
     ) {
       const parsed = tryParseJsonLenient(body);
       if (parsed) {
         const arr = Array.isArray(parsed) ? parsed : [parsed];
-        if (arr.length > 0 && arr.every((x) => x && VALID_LOCAL_TOOLS.includes(x.tool || x.name))) {
-          lastParsed = { kind: 'json-tools', specs: arr };
+        if (isValidToolSpecs(arr)) {
+          fallbackJsonSpecs = arr;
         }
       }
     }
   }
-  if (lastParsed) return lastParsed;
+  if (explicitSpecs.length > 0) return { kind: 'json-tools', specs: explicitSpecs };
+  if (lastNaturalTask) return lastNaturalTask;
+  if (fallbackJsonSpecs) return { kind: 'json-tools', specs: fallbackJsonSpecs };
 
   // 4. 兜底：模型没写围栏，直接在回复末尾输出了 [{"tool": ...}] 数组
   const tailIdx = markdownText.lastIndexOf('[{');
@@ -2337,7 +2574,10 @@ function computeReActStepDelayMs(step, everRefused = false) {
 }
 
 function buildRolloverHandoffPrompt(task) {
-  const protocol = buildSystemToolProtocol(task.cwd, task.protocolOpts || {});
+  const protocol = buildSystemToolProtocol(task.cwd, {
+    ...(task.protocolOpts || {}),
+    uiMode: task.uiMode,
+  });
   const rawQuestion = normalizeHomePathsInText(
     stripInjectedUserPrefixes(task.rawUserPrompt || '').cleanText || task.rawUserPrompt || ''
   )
@@ -2515,9 +2755,10 @@ async function runWebSubagentTool(args, workCwd, execContext = {}) {
     .replace(/^web:/i, '')
     .trim();
   const resolvedModel = rawModel || pickDefaultSubagentModel(parentTask?.webModel || '');
+  const { preset: rolePreset } = resolveSubagentRolePreset(role);
   const resolvedEffort = String(args.effort || args.Effort || 'low').trim().toLowerCase() || 'low';
-  const readOnly = args.readOnly !== false;
-  const maxSteps = Math.max(1, Math.min(8, Number(args.maxSteps || args.max_steps || 4)));
+  const readOnly = Boolean(isReadOnlyMode(parentTask?.uiMode) || (rolePreset.defaultReadOnly && args.readOnly !== false));
+  const maxSteps = Math.max(1, Math.min(8, Number(args.maxSteps || args.max_steps || rolePreset.defaultMaxSteps || 4)));
   const timeoutMs = Math.max(30000, Math.min(600000, Number(args.timeoutMs || args.timeout_ms || 240000)));
   const subCwd = args.cwd ? resolveSafePath(args.cwd, workCwd) : workCwd;
   const startedAt = Date.now();
@@ -2748,6 +2989,7 @@ async function runReActToolStep(task, parsedCall) {
   }
 
   let toolResultText = '';
+  let batchResults = [];
   if (parsedCall.kind === 'json-tools') {
     log(
       `[WebBrain ReAct${task.isSubagent ? `:Sub:${task.subagentRole || ''}` : ''}] 本地零 Token 执行 ${parsedCall.specs.length} 个工具...`
@@ -2759,9 +3001,13 @@ async function runReActToolStep(task, parsedCall) {
       {
         parentTask: task,
         protocolOpts: task.protocolOpts || {},
+        uiMode: task.uiMode,
         isSubagent: Boolean(task.isSubagent),
         readOnly: Boolean(task.readOnly),
         isCancelled: () => task.status === 'cancelled',
+        onBatchResults: (resList) => {
+          batchResults = Array.isArray(resList) ? resList : [];
+        },
       }
     );
   } else if (parsedCall.kind === 'natural-task') {
@@ -2828,15 +3074,88 @@ async function runReActToolStep(task, parsedCall) {
       : `本轮已补充 ${task.step} 批资料，请基于以上内容直接给出最终或阶段性纯文本结论，并说明待确认项，不再附清单块。`
     : task.isSubagent
       ? `${partialHint}以上是你要的资料。若核心位置被截断请立即补读该行段，否则请合并只读查询尽早收口；证据充分后直接输出精炼结论（路径用反引号 \`\` \`path:line\` \`\`）。`
-      : `${partialHint}以上是你要的资料。若还需查看或改动其他位置，请继续在末尾附精简 \`json:local-tool\` 清单（已知单点直查 1~3 项，跨模块调研可并行派发最多 ${MAX_CONCURRENT_SUBAGENTS} 个 \`web_subagent\`）；若信息已足够，请直接给出纯文本结论（路径用反引号 \`\` \`path:line\` \`\`）。${serialSubagentHint}`;
+      : `${partialHint}以上是你要的资料。若还需${task.readOnly ? '查证' : '查看或改动'}其他位置，请继续在末尾附精简 \`json:local-tool\` 清单（已知单点直查 1~3 项，跨模块调研可并行派发最多 ${MAX_CONCURRENT_SUBAGENTS} 个 \`web_subagent\`）；若信息已足够，请直接给出纯文本结论（路径用反引号 \`\` \`path:line\` \`\`）。${serialSubagentHint}`;
 
-  task.currentStepPrompt = [
-    `### 补充的工作区资料（第 ${task.step} 批${headerSuffix}）`,
-    '```text',
-    task.lastToolResultText,
-    '```',
-    nextStepInstruction,
-  ].join('\n');
+  // Phase 3 & 4：记录工具批次审计事件、Break-Loop 熔断检测与 Steer 纠偏注入
+  if (!task.isSubagent) {
+    appendSessionEvent(task.sessionId, 'tool_batch', {
+      requestId: task.requestId,
+      step: task.step,
+      tools: batchResults.map((r) => ({ tool: r.tool, ok: Boolean(r.ok), title: String(r.title || '').slice(0, 60) })),
+    });
+  }
+  const loopGuardRes = !task.isSubagent && batchResults.length ? evaluateBatchLoopGuard(task, batchResults) : { triggered: false, directive: '' };
+  if (loopGuardRes.triggered) {
+    appendSessionEvent(task.sessionId, 'loop_guard', {
+      requestId: task.requestId,
+      step: task.step,
+      code: loopGuardRes.code,
+      reason: loopGuardRes.reason,
+    });
+  }
+  const steerRes = !task.isSubagent ? drainSteerBlock(task) : { count: 0, block: '' };
+  if (steerRes.count > 0) {
+    appendSessionEvent(task.sessionId, 'steer_injected', {
+      requestId: task.requestId,
+      step: task.step,
+      count: steerRes.count,
+    });
+  }
+
+  // Phase 2：累计上下文预算并在达到阈值时触发 Proactive Rollover（主动换页压缩）
+  let proactiveRolloverTriggered = false;
+  if (!task.isSubagent && !isFinal && task.webChatUrl) {
+    try {
+      const charsDelta = String(task.lastToolResultText || '').length + String(task.currentStepText || '').length;
+      const st = bumpContextBudget(task.sessionId, { stepDelta: 1, charsDelta, mode: task.uiMode });
+      const rolloverCheck = shouldProactiveRollover(st);
+      if (rolloverCheck.needed && !task.proactiveRolledOver) {
+        proactiveRolloverTriggered = true;
+        task.proactiveRolledOver = true;
+        task.rolledOverFromWebChatUrl = task.webChatUrl;
+        task.forceNewChatNextDispatch = true;
+        task.webChatUrl = '';
+        task.webCursor = null;
+        const resetSt = bumpContextBudget(task.sessionId, { resetTabBudget: true, mode: task.uiMode });
+        const handoffBrief = formatTaskStateForHandoff(resetSt);
+        task.thoughts = [
+          task.thoughts,
+          `🔄 上下文预算达到主动换页阈值（${rolloverCheck.reason}），已自动保存进度并切换全新网页页签无损续跑…`,
+        ].filter(Boolean).join('\n');
+        appendSessionEvent(task.sessionId, 'proactive_rollover', {
+          requestId: task.requestId,
+          step: task.step,
+          reason: rolloverCheck.reason,
+          oldUrl: task.rolledOverFromWebChatUrl,
+        });
+        task.currentStepPrompt = [
+          buildSystemToolProtocol(task.cwd, task.protocolOpts || {}),
+          '---',
+          handoffBrief ? `### 前序任务交接简报
+${handoffBrief}` : '',
+          steerRes.block || '',
+          loopGuardRes.triggered ? loopGuardRes.directive : '',
+          `### 最新一批工作区资料（第 ${task.step} 批${headerSuffix}）`,
+          '```text',
+          task.lastToolResultText,
+          '```',
+          nextStepInstruction,
+        ].filter(Boolean).join('\n\n');
+      }
+    } catch (_) {}
+  }
+
+  if (!proactiveRolloverTriggered) {
+    task.currentStepPrompt = [
+      steerRes.block || '',
+      loopGuardRes.triggered ? loopGuardRes.directive : '',
+      `### 补充的工作区资料（第 ${task.step} 批${headerSuffix}）`,
+      '```text',
+      task.lastToolResultText,
+      '```',
+      nextStepInstruction,
+    ].filter(Boolean).join('\n');
+  }
   task.retryAttempt = 0;
   task.runningTools = false;
   task.status = 'queued';
@@ -2977,20 +3296,45 @@ function readJsonBody(req) {
   });
 }
 
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  if (PAGE_ORIGINS.has(origin)) return true;
+  return origin.startsWith('chrome-extension://');
+}
+
 function sendJson(res, status, obj) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Private-Network': 'true',
   });
   res.end(JSON.stringify(obj));
 }
 
 const server = http.createServer(async (req, res) => {
+  const origin = String(req.headers.origin || '');
+  if (!isAllowedOrigin(origin)) {
+    res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: false, error: 'Origin not allowed' }));
+    return;
+  }
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // 只有网页来源会走 Chrome 的 Private Network Access 预检；扩展来源不需要该头
+    if (PAGE_ORIGINS.has(origin)) res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+
   if (req.method === 'OPTIONS') {
     return sendJson(res, 204, {});
+  }
+
+  // POST 只收 application/json：拦住 no-cors 的 text/plain 简单请求，无需依赖 Origin 判断
+  if (req.method === 'POST') {
+    const contentType = String(req.headers['content-type'] || '').toLowerCase();
+    if (!contentType.includes('application/json')) {
+      return sendJson(res, 415, { ok: false, error: 'Content-Type must be application/json' });
+    }
   }
 
   const parsedUrl = new URL(req.url, `http://127.0.0.1:${PORT}`);
@@ -3019,6 +3363,8 @@ const server = http.createServer(async (req, res) => {
       const memDirs = resolveMemoryDirs(statusCwd);
       return sendJson(res, 200, {
         ok: true,
+        pid: process.pid,
+        startedAt: SERVER_STARTED_AT,
         sessionId: state.sessionId,
         cwd: state.cwd,
         backend: state.backend,
@@ -3038,6 +3384,21 @@ const server = http.createServer(async (req, res) => {
           toolIndexFile: toDisplayPath(LOCAL_TOOL_INDEX_FILE),
         },
       });
+    }
+
+    // 1.1 优雅停机端点：供 /restart-bridge 在 Windows 下无权限依赖地即时释放端口
+    if (req.method === 'POST' && pathname === '/admin/shutdown') {
+      if (origin) return sendJson(res, 403, { ok: false, error: 'Local native client only' });
+      log(`[Bridge] 收到 /admin/shutdown 指令，准备优雅退出 (PID=${process.pid})`);
+      const srvRef = res.socket?.server || null;
+      sendJson(res, 200, { ok: true, pid: process.pid, shuttingDown: true });
+      setTimeout(() => {
+        try {
+          if (srvRef) srvRef.close(() => process.exit(0));
+        } catch (_) {}
+        setTimeout(() => process.exit(0), 250).unref();
+      }, 40);
+      return;
     }
 
     // 2. 浏览器扩展轮询待执行指令 (/browser/poll)
@@ -3646,6 +4007,8 @@ const server = http.createServer(async (req, res) => {
       if (!rawPrompt) return sendJson(res, 400, { ok: false, error: 'prompt 不能为空' });
 
       const taskCwd = body.cwd || state.cwd || DEFAULT_CWD;
+      const uiMode = normalizeUiMode(body.uiMode);
+      const modePolicy = getModePolicy(uiMode);
       const serverReAct = body.agentMode !== false;
       const alreadyHasProtocol = /### 工作区资料协作说明|### 本地协作约定|### 本地开发工作区工具说明|\[System Tool Protocol\]/.test(rawPrompt);
       const injectProtocol = body.injectProtocol !== false && serverReAct && !alreadyHasProtocol;
@@ -3654,10 +4017,6 @@ const server = http.createServer(async (req, res) => {
         rulesDir: typeof body.rulesDir === 'string' && body.rulesDir.trim() ? body.rulesDir.trim() : undefined,
         memoryDir: typeof body.memoryDir === 'string' && body.memoryDir.trim() ? body.memoryDir.trim() : undefined,
       };
-      const researchHint = detectMultiModuleResearchHint(rawPrompt);
-      const firstPrompt = injectProtocol
-        ? `${buildSystemToolProtocol(taskCwd, { ...protocolOpts, researchHint })}\n\n${rawPrompt}`
-        : rawPrompt;
 
       if (body.webModel) webModelState.desiredModel = String(body.webModel).trim();
       if (body.webEffort) webModelState.desiredEffort = String(body.webEffort).trim().toLowerCase();
@@ -3666,6 +4025,33 @@ const server = http.createServer(async (req, res) => {
       const targetSessionId = String(body.sessionId || requestId);
       const newChat = Boolean(body.newChat);
       const rawMax = Number(body.maxSteps);
+
+      const prevSessionMode = newChat ? null : sessionLastUiMode.get(targetSessionId);
+      sessionLastUiMode.set(targetSessionId, uiMode);
+
+      const researchHint = detectMultiModuleResearchHint(rawPrompt);
+      let contextHints = '';
+      if (injectProtocol) {
+        try {
+          const cleanForRoute = stripInjectedUserPrefixes(rawPrompt).cleanText || rawPrompt;
+          const rulesItems = listRuleEntries(taskCwd, protocolOpts).items;
+          const memoryItems = listMemoryEntries(taskCwd, protocolOpts).entries;
+          contextHints = buildContextHintsBlock({
+            rawPrompt: cleanForRoute,
+            rulesItems,
+            memoryItems,
+          });
+        } catch {}
+      }
+      const modeChangeNotice =
+        !injectProtocol && prevSessionMode && prevSessionMode !== uiMode
+          ? buildModeChangeNotice(prevSessionMode, uiMode)
+          : '';
+      const firstPrompt = injectProtocol
+        ? `${buildSystemToolProtocol(taskCwd, { ...protocolOpts, uiMode, researchHint, contextHints })}\n\n${rawPrompt}`
+        : modeChangeNotice
+          ? `${modeChangeNotice}\n\n${rawPrompt}`
+          : rawPrompt;
 
       // 若同一对话栏此前有残留未结任务，仅替换清理本会话的旧任务（含其派生子代理），避免阻塞本会话新消息且不影响其它对话栏
       if (body.sessionId) {
@@ -3685,7 +4071,8 @@ const server = http.createServer(async (req, res) => {
         sessionId: targetSessionId,
         isSubagent: false,
         parentRequestId: '',
-        readOnly: false,
+        uiMode,
+        readOnly: Boolean(modePolicy.readOnly),
         childRequestIds: new Set(),
         cwd: taskCwd,
         protocolOpts,
@@ -3716,7 +4103,12 @@ const server = http.createServer(async (req, res) => {
         everRefused: false,
         forceNewChatNextDispatch: false,
         hasAutoRolledOver: false,
+        proactiveRolledOver: false,
         rolledOverFromWebChatUrl: '',
+        steerQueue: [],
+        loopGuard: createLoopGuardState(),
+        pendingApproval: null,
+        planEntries: toClientPlanEntries(loadTaskState(targetSessionId, uiMode)),
         falseLimitRetries: 0,
         text: '',
         thoughts: '',
@@ -3731,8 +4123,14 @@ const server = http.createServer(async (req, res) => {
         updatedAt: Date.now(),
       };
       webTasks.set(requestId, task);
+      appendSessionEvent(targetSessionId, 'turn_start', {
+        requestId,
+        mode: uiMode,
+        newChat,
+        model: task.webModel || webModelState.desiredModel || '',
+      });
       log(
-        `[WebBrain] 新任务 requestId=${requestId} cursor=${task.webCursor?.cId || 'new'} newChat=${newChat} model=${task.webModel || webModelState.desiredModel}`
+        `[WebBrain] 新任务 requestId=${requestId} mode=${uiMode} cursor=${task.webCursor?.cId || 'new'} newChat=${newChat} model=${task.webModel || webModelState.desiredModel}`
       );
       return sendJson(res, 200, {
         ok: true,
@@ -3760,7 +4158,11 @@ const server = http.createServer(async (req, res) => {
         webChatUrl: task.webChatUrl || '',
         webCursor: task.webCursor || null,
         autoRolledOver: Boolean(task.hasAutoRolledOver),
+        proactiveRolledOver: Boolean(task.proactiveRolledOver),
         rolledOverFromWebChatUrl: task.rolledOverFromWebChatUrl || '',
+        planEntries: Array.isArray(task.planEntries) ? task.planEntries : [],
+        pendingApproval: task.pendingApproval || null,
+        steerQueueCount: Array.isArray(task.steerQueue) ? task.steerQueue.length : 0,
         error: task.error,
         browserOnline: isBrowserOnline(),
         webModelState,
@@ -3805,6 +4207,64 @@ const server = http.createServer(async (req, res) => {
         `[WebBrain] 取消任务: requestId=${body.requestId || '-'} session=${body.sessionId || '-'} cancelled=${cancelledCount}`
       );
       return sendJson(res, 200, { ok: true, cancelledCount });
+    }
+
+    // 7.0a 运行中插话纠偏 (/web-brain/steer)
+    if (req.method === 'POST' && pathname === '/web-brain/steer') {
+      const body = await readJsonBody(req).catch(() => ({}));
+      const message = String(body.message || body.prompt || '').trim();
+      if (!message) return sendJson(res, 400, { ok: false, error: 'steer message 不能为空' });
+      let targetTask = body.requestId ? webTasks.get(String(body.requestId)) : null;
+      if (!targetTask && body.sessionId) {
+        const sid = String(body.sessionId);
+        for (const t of webTasks.values()) {
+          if (!t.isSubagent && t.sessionId === sid && (t.status === 'queued' || t.status === 'dispatched' || t.status === 'streaming')) {
+            targetTask = t;
+          }
+        }
+      }
+      if (!targetTask || (targetTask.status !== 'queued' && targetTask.status !== 'dispatched' && targetTask.status !== 'streaming')) {
+        return sendJson(res, 404, { ok: false, error: '当前没有可插话的运行中 Web 任务' });
+      }
+      const entry = enqueueSteer(targetTask, message);
+      appendSessionEvent(targetTask.sessionId, 'steer_enqueued', {
+        requestId: targetTask.requestId,
+        steerId: entry?.id,
+        preview: message.slice(0, 120),
+      });
+      log(`[WebBrain Harness] 收到运行中 Steer requestId=${targetTask.requestId} queued=${targetTask.steerQueue.length}`);
+      return sendJson(res, 200, {
+        ok: true,
+        requestId: targetTask.requestId,
+        steerId: entry?.id || '',
+        queuedCount: targetTask.steerQueue.length,
+      });
+    }
+
+    // 7.0b Ask 模式写操作审批决议 (/web-brain/approve)
+    if (req.method === 'POST' && pathname === '/web-brain/approve') {
+      const body = await readJsonBody(req).catch(() => ({}));
+      const approvalId = String(body.approvalId || '').trim();
+      const resolver = approvalId ? pendingApprovalResolvers.get(approvalId) : null;
+      if (!resolver) {
+        return sendJson(res, 404, { ok: false, error: '审批请求不存在或已过期' });
+      }
+      const decision = String(body.decision || 'deny').trim().toLowerCase();
+      const enableAutoMode = Boolean(body.enableAutoMode);
+      if (enableAutoMode && resolver.task) {
+        resolver.task.uiMode = 'auto';
+        resolver.task.readOnly = false;
+        sessionLastUiMode.set(resolver.task.sessionId, 'auto');
+      }
+      appendSessionEvent(resolver.task?.sessionId, 'approval_resolved', {
+        requestId: resolver.task?.requestId,
+        approvalId,
+        decision,
+        enableAutoMode,
+      });
+      resolver.finish({ decision: decision === 'allow' || enableAutoMode ? 'allow' : 'deny' });
+      log(`[WebBrain Harness] 审批决议 approvalId=${approvalId} decision=${decision} auto=${enableAutoMode}`);
+      return sendJson(res, 200, { ok: true, approvalId, decision });
     }
 
     // 7.1 读取 Gemini 网页端侧边栏最近历史对话列表 (/web-brain/conversations)

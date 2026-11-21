@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ZeroG Code — Gemini Web Bridge",
-  "version": "2.6.8",
+  "version": "2.7.0",
   "description": "Bidirectional bridge between ZeroG Code (VS Code / Cursor) and gemini.google.com: local tools, model & effort sync, /sync & /pull history, auto-managed web tabs.",
   "icons": {
     "16": "icon.png",
@@ -10,6 +10,7 @@
   },
   "permissions": [
     "tabs",
+    "debugger",
     "scripting",
     "proxy",
     "storage",
@@ -27,8 +28,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://gemini.google.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ]

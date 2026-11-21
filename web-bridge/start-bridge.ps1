@@ -1,6 +1,7 @@
 param(
     [string]$Cwd = "",
-    [int]$Port = 18765
+    [int]$Port = 18765,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,7 +13,11 @@ if (-not $Cwd) {
     $Cwd = if ($env:WEB_BRIDGE_CWD) { $env:WEB_BRIDGE_CWD } else { (Get-Location).Path }
 }
 
-if (Test-Path $PidFile) {
+if ($Force) {
+    $StopScript = Join-Path $Dir "stop-bridge.ps1"
+    if (Test-Path $StopScript) { & $StopScript | Out-Null }
+    Start-Sleep -Milliseconds 350
+} elseif (Test-Path $PidFile) {
     $oldPid = Get-Content $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($oldPid -and ($oldPid -as [int])) {
         $proc = Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue
